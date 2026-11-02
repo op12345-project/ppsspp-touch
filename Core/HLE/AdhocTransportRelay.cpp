@@ -311,6 +311,49 @@ int RelayTransport::DoBlockingPtpSend(AdhocSocketRequest &req, s64 &result) {
 	return 0;
 }
 
+// A PSP's back-to-back PTP sends arrive about a millisecond apart, 0.95 ms plus 0.65 us a byte, so a receiver
+// polling fast reads them one at a time; once they have all arrived they come back together (pspautotests
+// net/adhoc/pair/ptpsegments, ptpmsg). Capcom Classics Collection Reloaded's Street Fighter II needs the
+// split. The relay keeps each send as a block, and a block becomes readable no earlier than the previous one
+// plus that gap. Returns how many bytes can be read now, or AEMU_POSTOFFICE_CLIENT_SESSION_DEAD; sizes gets
+// the buffered blocks.
+static int ptpReadableBytes(AdhocSocket *sock, int *sizes, int *count) {
+	const int maxBlocks = (int)ARRAY_SIZE(sock->ptpBlockReadableAt);
+	int n = ptp_peek_block_sizes(sock->postofficeHandle, sizes, maxBlocks);
+	*count = std::max(n, 0);
+	if (n < 0) {
+		return n;
+	}
+	u64 now = CoreTiming::GetGlobalTimeUsScaled();
+	sock->ptpBlocksKnown = std::min(sock->ptpBlocksKnown, n);
+	for (int i = sock->ptpBlocksKnown; i < n; ++i) {
+		u64 at = now;
+		if (sock->ptpLastBlockReadableAt != 0) {
+			at = std::max(now, sock->ptpLastBlockReadableAt + 950 + (u64)sizes[i] * 13 / 20);
+		}
+		sock->ptpBlockReadableAt[i] = at;
+		sock->ptpLastBlockReadableAt = at;
+	}
+	sock->ptpBlocksKnown = n;
+	int bytes = 0;
+	for (int i = 0; i < n && sock->ptpBlockReadableAt[i] <= now; ++i) {
+		bytes += sizes[i];
+	}
+	return bytes;
+}
+
+static void ptpBlocksConsumed(AdhocSocket *sock, const int *sizes, int count, int consumed) {
+	int done = 0;
+	while (done < count && done < sock->ptpBlocksKnown && consumed >= sizes[done]) {
+		consumed -= sizes[done];
+		done++;
+	}
+	if (done > 0) {
+		memmove(sock->ptpBlockReadableAt, sock->ptpBlockReadableAt + done, (sock->ptpBlocksKnown - done) * sizeof(u64));
+		sock->ptpBlocksKnown -= done;
+	}
+}
+
 static int ptp_recv_postoffice(int idx, void *data, int *len) {
 	// Out of the group, nothing arrives, and the connection doesn't fail either (pspautotests
 	// net/adhoc/pair/vanish), whatever became of the relay meanwhile.
@@ -335,6 +378,17 @@ static int ptp_recv_postoffice(int idx, void *data, int *len) {
 
 	int len_copy = *len;
 
+	int sizes[ARRAY_SIZE(internal->ptpBlockReadableAt)];
+	int blocks = 0;
+	int readable = ptpReadableBytes(internal, sizes, &blocks);
+	if (readable == 0) {
+		return SCE_NET_ADHOC_ERROR_WOULD_BLOCK;
+	}
+	// A dead session still hands out what it has buffered, all of it.
+	if (readable > 0) {
+		len_copy = std::min(len_copy, readable);
+	}
+
 	int ptp_recv_status = ptp_recv(internal->postofficeHandle, (char *)data, &len_copy, true);
 	if (ptp_recv_status == AEMU_POSTOFFICE_CLIENT_SESSION_DEAD) {
 		// the session is dead, need to be reflected to the other side
@@ -348,6 +402,7 @@ static int ptp_recv_postoffice(int idx, void *data, int *len) {
 
 	// AEMU_POSTOFFICE_CLIENT_SESSION_DATA_TRUNC is okay, it just means it has data in it's user space buffer
 
+	ptpBlocksConsumed(internal, sizes, blocks, len_copy);
 	*len = len_copy;
 	return 0;
 }
@@ -503,6 +558,16 @@ static const double RELAY_CONNECT_WAIT_SECONDS = 1.0;
 
 void RelayTransport::Poll() {
 	fillRelayBacklogs();
+
+	// Note PTP blocks as they arrive, so their spacing starts then rather than when the game first looks.
+	for (int i = 0; i < MAX_SOCKET; i++) {
+		AdhocSocket *sock = adhocSockets[i];
+		if (sock != NULL && sock->type == SOCK_PTP && sock->data.ptp.state == ADHOC_PTP_STATE_ESTABLISHED && sock->postofficeHandle != NULL) {
+			int sizes[ARRAY_SIZE(sock->ptpBlockReadableAt)];
+			int blocks = 0;
+			ptpReadableBytes(sock, sizes, &blocks);
+		}
+	}
 
 	// A connect takes a few round trips through the relay, in real time, and the PSP has an opened
 	// connection up a few ms after PtpOpen (pspautotests net/adhoc/pair/ptppoll). So wait for it here, at
@@ -752,7 +817,9 @@ static bool postoffice_can_recv_or_listen_has_request(int idx) {
 			if (ptp_handle == NULL) {
 				return false;
 			}
-			int peek_len = ptp_peek_next_size(ptp_handle);
+			int sizes[ARRAY_SIZE(internal->ptpBlockReadableAt)];
+			int blocks = 0;
+			int peek_len = ptpReadableBytes(internal, sizes, &blocks);
 			// A closed connection reads as readable, so the poll looks at PtpPeerClosed.
 			if (peek_len == AEMU_POSTOFFICE_CLIENT_SESSION_DEAD) {
 				return true;
@@ -841,7 +908,9 @@ void RelayTransport::PtpUpdateRecvStat(AdhocSocket *sock) {
 	// A listener's handle is a listen session, which has no data.
 	int waiting = 0;
 	if (sock->postofficeHandle != NULL && sock->data.ptp.state != ADHOC_PTP_STATE_LISTEN) {
-		waiting = ptp_peek_next_size(sock->postofficeHandle);
+		int sizes[ARRAY_SIZE(sock->ptpBlockReadableAt)];
+		int blocks = 0;
+		waiting = ptpReadableBytes(sock, sizes, &blocks);
 	}
 	sock->data.ptp.rcv_sb_cc = std::max(0, waiting);
 }
