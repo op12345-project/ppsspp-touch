@@ -4,6 +4,24 @@ These rules apply to this repository by default.
 
 Ignore the folder ai_instructions in the root directory, it's old stuff from contributors.
 
+## PPSSPP Touch shared development context
+
+This is the independent PPSSPP Touch fork (`op12345-project/ppsspp-touch`), developed on
+`develop`. Read [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md) at the start of each task, then
+read the relevant instructions below and any task-specific guides. Check `git status` and recent
+commits before changing files. Current code and Git history take precedence if a document is stale.
+
+After each meaningful completed task, update `docs/CURRENT_STATE.md` with actual changes, tests
+run, unresolved issues, and the next action. Update [docs/ROADMAP.md](docs/ROADMAP.md) and
+[docs/DECISIONS.md](docs/DECISIONS.md) only when plans or decisions change. Keep these files
+concise, never claim unrun tests passed, and never overwrite another agent's uncommitted changes.
+
+Preserve existing PPSSPP behavior and upstream compatibility. The fork's goal is unified mouse
+and touchscreen interaction for PSP games, initially Tag Force 3, 5, 6, and ARC-V Special, with
+keyboard/controller and hybrid input retained. Add game-specific profiles when needed. Keep the
+original PPSSPP installation and existing Syncthing configuration untouched. Do not modify the
+emulation core without explicit authorization.
+
 ## Detailed guides
 
 The rules below are the short version. These docs hold the detail, look them up when the task calls
