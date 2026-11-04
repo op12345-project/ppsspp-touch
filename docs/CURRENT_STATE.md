@@ -2,32 +2,34 @@
 
 Updated: 2026-11-04. Branch: `develop`. Repository: `op12345-project/ppsspp-touch`.
 
-## Progress
+## Verified baseline and findings
 
-- User reports that the Windows build works with independent storage, and that an Android build
-  was installed alongside original PPSSPP on a Huawei device. These results were not rechecked
-  during this documentation task.
-- Target Android package ID: `com.hesham.ppsspptouch`. The current uncommitted
-  `android/build.gradle.kts` change sets this ID for the `normal` flavor; an uncommitted
-  `android/res/values/strings.xml` change renames the app and shortcut.
-- Unified mouse/touch interaction for Tag Force 3, 5, 6, and ARC-V Special remains the main
-  development goal. No implementation status for those interactions was verified here.
+- Windows: the user tested the build and settings persistence. `C:\Apps\PPSSPP-Touch\PPSSPPWindows64.exe`
+  exists; its `installed.txt` points to `C:\PPSSPP-Touch-Data`, which also exists. This task
+  confirmed the paths, not the prior runtime test.
+- Android: the user built and installed the APK alongside original PPSSPP on Huawei and tested
+  storage isolation and saving. The uncommitted `android/build.gradle.kts` change sets the
+  `normal` flavor application ID to `com.hesham.ppsspptouch`. Shared Android labels retain upstream
+  values; `android/normal/res/values/strings.xml` gives only Normal the Touch app and shortcut
+  labels. The namespace, default application ID, and other flavor IDs retain upstream values.
+- Claude's baseline findings were supplied by the user; no separate Claude report is present in
+  this checkout. The upstream Android test examples target `org.ppsspp.ppsspp`; the fork-specific
+  install check now targets `com.hesham.ppsspptouch` in `docs/android-device-testing.md`.
 
-## Changes in this task
+## Changes and checks
 
-- Added the shared handoff documents and linked both agent instruction files to this state.
-- No emulator functionality changed.
+- Added fork-specific Android test commands in `docs/android-device-testing.md`. This task moved
+  Touch branding to Normal's resource overlay; no emulator code changed.
+- Parsed the shared and flavor resource XML and verified app/shortcut labels: Normal `PPSSPP Touch` /
+  `PPSSPP Touch game`; Gold `PPSSPP Gold` / `PPSSPP game`; Legacy `PPSSPP Legacy` / `PPSSPP game`;
+  VR `PPSSPP` / `PPSSPP game`. Confirmed Normal's package ID in Gradle. `git diff --check` passed.
+- Gradle resource-merge tasks could not run because the wrapper attempted to download Gradle 9.8.0
+  and network access was denied. No APK or device test was run in this task.
 
-## Tests and issues
+## Limitations and next action
 
-- Documentation checks: required files exist; both agent files reference this state;
-  the `AGENTS.md` diff contains only an added section; `git diff --check` passed.
-- Emulator builds, unit tests, pspautotests, and Android device tests were not run for this
-  documentation-only task.
-- Uncommitted work seen at the first status check must be reviewed by its owner: `android/build.gradle.kts`,
-  `android/res/values/strings.xml`, `android/build.gradle.kts.backup`, and `ext/libchdr`.
-
-## Next action
-
-Review the existing Android changes and baseline the current Windows/Android behavior before
-implementing a first mouse/touch interaction slice. Preserve the original app and Syncthing setup.
+- Mouse/touch interaction work for Tag Force 3, 5, 6, and ARC-V Special has not begun here.
+- The Android changes remain uncommitted. `android/build.gradle.kts.backup` is an untracked copy
+  of the upstream Gradle file, and `ext/libchdr` reports untracked content; both were left alone.
+- Preserve original PPSSPP and Syncthing. Next, establish a first game interaction scenario and
+  baseline keyboard/controller behavior before implementing unified input outside the core.

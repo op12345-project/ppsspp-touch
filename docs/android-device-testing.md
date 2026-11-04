@@ -23,6 +23,12 @@ Verify after every install, not just when something looks odd:
 
     adb shell dumpsys package org.ppsspp.ppsspp | grep versionName
 
+Commands in this guide using `org.ppsspp.ppsspp` target upstream PPSSPP. For the PPSSPP Touch
+`normal` flavor, use its own package when checking an install or process:
+
+    adb shell dumpsys package com.hesham.ppsspptouch | grep versionName
+    adb shell pidof com.hesham.ppsspptouch
+
 A second, independent check is worth it when a result is surprising: grep the log for a symbol that
 exists only on the branch under test (a renamed class or log tag, say).
 
