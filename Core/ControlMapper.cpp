@@ -305,6 +305,7 @@ void ControlMapper::ReleaseAll() {
 	for (const auto &key : keys) {
 		Key(key);
 	}
+	SetNavigationButtons(0, CTRL_MASK_USER);
 }
 
 
@@ -547,6 +548,8 @@ bool ControlMapper::UpdatePSPState(const InputMapping &changedMapping, double no
 		}
 	}
 
+	mappedButtons_ = buttonMask;
+	buttonMask |= navigationButtons_;
 	// We only request changing the buttons where the mapped input was involved.
 	for (auto listener : listeners_) {
 		listener->UpdatePSPButtons(buttonMask & changedButtonMask, (~buttonMask) & changedButtonMask);
@@ -846,6 +849,25 @@ void ControlMapper::PSPKey(int deviceId, int pspKeyCode, KeyInputFlags flags) {
 			for (auto listener : listeners_) {
 				listener->UpdatePSPButtons(0, pspKeyCode);
 			}
+	}
+}
+
+uint32_t ControlMapper::MappedButtons() {
+	std::lock_guard<std::mutex> guard(mutex_);
+	return mappedButtons_;
+}
+
+void ControlMapper::SetNavigationButtons(uint32_t bitsToSet, uint32_t bitsToClear) {
+	std::lock_guard<std::mutex> guard(mutex_);
+	uint32_t before = mappedButtons_ | navigationButtons_;
+	navigationButtons_ = (navigationButtons_ | (bitsToSet & CTRL_MASK_USER)) & ~(bitsToClear & CTRL_MASK_USER);
+	uint32_t after = mappedButtons_ | navigationButtons_;
+	uint32_t changed = before ^ after;
+	if (!changed) {
+		return;
+	}
+	for (auto listener : listeners_) {
+		listener->UpdatePSPButtons(after & changed, (~after) & changed);
 	}
 }
 

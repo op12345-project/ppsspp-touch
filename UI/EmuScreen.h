@@ -32,8 +32,12 @@
 #include "Core/ControlMapper.h"
 #include "Core/CoreParameter.h"
 #include "UI/ImDebugger/ImCommand.h"
+#include "UI/TouchNavigation.h"
+#include "UI/TagForce3LanguageSelection.h"
+#include "UI/TagForce3Duel.h"
 
 struct AxisInput;
+struct FRect;
 struct DisplayLayoutConfig;
 
 class AsyncImageFileView;
@@ -106,6 +110,20 @@ private:
 
 	void ProcessQueuedVKeys();
 	void ProcessVKey(VirtKey vkey, bool down);
+	void ResetTouchNavigation();
+	void CancelTF3LanguageSelection();
+	int TF3LanguageHit(float x, float y) const;
+	bool TF3GameViewport(FRect *viewport) const;
+	void UpdateTF3DuelState(bool active);
+	void LogTF3DuelPointer(float x, float y) const;
+	TagForce3Duel::HandActionPlanner::Context TF3DuelContext() const;
+	void ApplyTF3DuelStep(TagForce3Duel::HandActionPlanner::Step step);
+	void CancelTF3DuelInput(TagForce3Duel::HandActionPlanner::CancelReason reason);
+	bool TF3DuelTouch(const TouchInput &touch, bool mouseMapped, bool *consumed);
+	TagForce3Duel::FieldActionPlanner::Context TF3FieldContext() const;
+	void ApplyTF3FieldStep(TagForce3Duel::FieldActionPlanner::Step step);
+	void CancelTF3FieldInput(TagForce3Duel::FieldActionPlanner::CancelReason reason);
+	void QueueTouchNavigation(TouchNavigationGesture gesture);
 
 	bool ShouldRunEmulation(ScreenRenderMode mode) const;
 
@@ -153,6 +171,26 @@ private:
 	// Set when the chat opens. Stick movements don't reach the control mapper while it's open (key
 	// releases do), so what's held is let go up front.
 	bool releaseMapperInput_ = false;
+	TouchNavigation touchNavigation_;
+	TagForce3Language::Snapshot tf3LanguageSnapshot_;
+	TagForce3Language::Planner tf3LanguagePlanner_;
+	TouchNavigation tf3LanguagePointer_;
+	int tf3LanguageDownTarget_ = -1;
+	uint32_t tf3StateSerial_ = 0;
+	bool tf3StateBusy_ = false;
+	bool tf3LanguagePatternSeen_ = false;
+	TagForce3Duel::Snapshot tf3DuelSnapshot_;
+	TagForce3Duel::StabilityGate tf3DuelGate_;
+	TagForce3Duel::HandActionPlanner tf3DuelPlanner_;
+	TouchNavigation tf3DuelPointer_;
+	int tf3DuelDownTarget_ = -1;
+	bool tf3DuelLogged_ = false;
+	// Field state, read with TF3DuelProbe or TF3DuelFieldInput on.
+	TagForce3Duel::FieldSnapshot tf3FieldSnapshot_;
+	TagForce3Duel::FieldStabilityGate tf3FieldGate_;
+	bool tf3FieldLogged_ = false;
+	TagForce3Duel::FieldActionPlanner tf3FieldPlanner_;
+	int tf3FieldDownTarget_ = -1;
 
 	UI::Button *cardboardDisableButton_ = nullptr;
 

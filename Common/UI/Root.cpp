@@ -323,12 +323,13 @@ bool KeyEvent(const KeyInput &key, ViewGroup *root) {
 	return root->Key(key);
 }
 
-void TouchEvent(const TouchInput &touch, ViewGroup *root) {
+bool TouchEvent(const TouchInput &touch, ViewGroup *root) {
 	focusForced = false;
-	root->Touch(touch);
+	bool handled = root->Touch(touch);
 	if ((touch.flags & TouchInputFlags::DOWN) && !focusForced) {
 		EnableFocusMovement(false);
 	}
+	return handled;
 }
 
 static void FakeKeyEvent(const KeyInput &key, ViewGroup *root) {

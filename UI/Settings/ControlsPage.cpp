@@ -79,6 +79,23 @@ void BuildControlsSettings(SettingsPage *page) {
 	page->Setting(&g_Config.fAnalogTriggerThreshold);
 	page->Setting(&g_Config.fAnalogStickThreshold);
 
+#if PPSSPP_PLATFORM(WINDOWS) || PPSSPP_PLATFORM(ANDROID)
+	if (deviceType != DEVICE_TYPE_VR) {
+		page->Header("In-game pointer navigation");
+		page->Setting(&g_Config.bTouchNavigation);
+		page->Setting(&g_Config.iTouchNavigationConfirmButton).Enabled(&g_Config.bTouchNavigation);
+		page->Header("Experimental game interaction");
+		page->Setting(&g_Config.bTF3LanguageProbe);
+		page->Hint({ I18NCat::CONTROLS, "TF3LanguageProbe Tip", "Experimental: tap or left-click a TF3 Language Settings row to highlight it. Does not confirm the choice." });
+		page->Setting(&g_Config.bTF3DuelHandInput);
+		page->Hint({ I18NCat::CONTROLS, "TF3DuelHandInput Tip", "Experimental: tap or left-click a card in your TF3 duel hand to select it, and tap it again for X. At the End Phase hand limit, one tap discards that card." });
+		page->Setting(&g_Config.bTF3DuelFieldInput);
+		page->Hint({ I18NCat::CONTROLS, "TF3DuelFieldInput Tip", "Experimental: during your own TF3 duel turn, tap or left-click a card on either side of the field to move the cursor to it. Never presses X." });
+		page->Setting(&g_Config.bTF3DuelProbe);
+		page->Hint({ I18NCat::CONTROLS, "TF3DuelProbe Tip", "Experimental: logs TF3 duel hand state and the card under the pointer. Does not change the game or send input." });
+	}
+#endif
+
 	// TVs don't have touch control, at least not yet.
 	if ((deviceType != DEVICE_TYPE_TV) && (deviceType != DEVICE_TYPE_VR)) {
 		page->Header("On-screen touch controls");

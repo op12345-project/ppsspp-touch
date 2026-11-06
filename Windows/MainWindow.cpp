@@ -1224,7 +1224,7 @@ namespace MainWindow {
 					const float dx = lastMouseDownX - x;
 					const float dy = lastMouseDownY - y;
 					const float distSq = dx * dx + dy * dy;
-					if (distSq < 3.0f*3.0f && !g_Config.bShowTouchControls && !g_Config.bShowImDebugger && !g_Config.bMouseControl && uiState == UISTATE_INGAME && g_Config.bFullscreenOnDoubleclick) {
+					if (distSq < 3.0f*3.0f && !g_Config.bShowTouchControls && !g_Config.bShowImDebugger && !g_Config.bMouseControl && uiState == UISTATE_INGAME && g_Config.bFullscreenOnDoubleclick && !g_Config.bTF3DuelHandInput && !g_Config.bTF3DuelFieldInput) {
 						g_Config.bFullScreen = !g_Config.bFullScreen;
 						SendApplyFullscreenState();
 					}

@@ -47,6 +47,10 @@ public:
 	// Combined with the mapped input. Unlike __Ctrl APIs, this supports
 	// virtual key codes, including analog mappings.
 	void PSPKey(int deviceId, int pspKeyCode, KeyInputFlags flags);
+	// In-game pointer navigation, combined with mapped keyboard/controller buttons.
+	void SetNavigationButtons(uint32_t bitsToSet, uint32_t bitsToClear);
+	// PSP buttons currently held through the mappings, excluding navigation.
+	uint32_t MappedButtons();
 
 	// Toggle swapping DPAD and Analog. Useful on some input devices with few buttons.
 	void ToggleSwapAxes();
@@ -126,6 +130,8 @@ private:
 	std::mutex mutex_;
 
 	std::map<InputMapping, InputSample> curInput_;
+	uint32_t mappedButtons_ = 0;
+	uint32_t navigationButtons_ = 0;
 
 	// While a combo mapping is fully held, the shorter mappings that its inputs also belong to are
 	// suppressed - see UpdateComboSuppression. Maps an input to the size of the longest satisfied

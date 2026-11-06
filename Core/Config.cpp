@@ -1281,6 +1281,7 @@ static constexpr ConfigSetting touchControlSettings[] = {
 };
 
 static constexpr const char *touchButtonStyleNames[] = { "Classic", "Thin borders", "Glowing borders" };
+static constexpr const char *touchNavigationConfirmNames[] = { "Cross", "Circle", "Square", "Triangle" };
 
 static constexpr ConfigSetting controlSettings[] = {
 	ConfigSetting("HapticFeedback", SETTING(g_Config, bHapticFeedback), false, CfgFlag::PER_GAME)
@@ -1368,6 +1369,18 @@ static constexpr ConfigSetting controlSettings[] = {
 	ConfigSetting("AllowMappingCombos", SETTING(g_Config, bAllowMappingCombos), false, CfgFlag::DEFAULT),
 	ConfigSetting("StrictComboOrder", SETTING(g_Config, bStrictComboOrder), false, CfgFlag::DEFAULT),
 
+	ConfigSetting("TouchNavigation", SETTING(g_Config, bTouchNavigation), false, CfgFlag::PER_GAME)
+		.Label(I18NCat::CONTROLS, "In-game pointer navigation"),
+	ConfigSetting("TF3LanguageProbe", SETTING(g_Config, bTF3LanguageProbe), false, CfgFlag::PER_GAME)
+		.Label(I18NCat::CONTROLS, "Experimental TF3 language probe"),
+	ConfigSetting("TF3DuelProbe", SETTING(g_Config, bTF3DuelProbe), false, CfgFlag::PER_GAME)
+		.Label(I18NCat::CONTROLS, "Experimental TF3 duel probe"),
+	ConfigSetting("TF3DuelHandInput", SETTING(g_Config, bTF3DuelHandInput), false, CfgFlag::PER_GAME)
+		.Label(I18NCat::CONTROLS, "Experimental TF3 duel hand selection"),
+	ConfigSetting("TF3DuelFieldInput", SETTING(g_Config, bTF3DuelFieldInput), false, CfgFlag::PER_GAME)
+		.Label(I18NCat::CONTROLS, "Experimental TF3 duel field selection"),
+	ConfigSetting("TouchNavigationConfirmButton", SETTING(g_Config, iTouchNavigationConfirmButton), 0, CfgFlag::PER_GAME)
+		.Label(I18NCat::CONTROLS, "Pointer confirm button").Choices(touchNavigationConfirmNames),
 	ConfigSetting("UseMouse", SETTING(g_Config, bMouseControl), false, CfgFlag::PER_GAME)
 		.Label(I18NCat::CONTROLS, "Use Mouse Control"),
 	ConfigSetting("ConfineMap", SETTING(g_Config, bMouseConfine), false, CfgFlag::PER_GAME)

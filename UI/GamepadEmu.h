@@ -40,6 +40,11 @@ class GamepadComponent : public UI::View {
 public:
 	GamepadComponent(std::string_view key, UI::LayoutParams *layoutParams);
 
+	// Controls track what they really claim with usedPointerMask (see GamepadTouchUsed), so a touch
+	// anywhere else on screen isn't reported as handled by the UI.
+	bool Touch(const TouchInput &input) override {
+		return false;
+	}
 	bool Key(const KeyInput &input) override {
 		return false;
 	}
@@ -430,5 +435,7 @@ namespace GestureKey {
 
 void GamepadTouch();
 void GamepadResetTouch();
+bool GamepadTouchUsed(int pointerId);
+bool GamepadAnyTouchUsed();
 void GamepadUpdateOpacity(float force = -1.0f);
 float GamepadGetOpacity();

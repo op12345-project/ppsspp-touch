@@ -47,7 +47,7 @@ enum class KeyEventResult {
 KeyEventResult KeyEventToFocusMoves(const KeyInput &key);
 
 bool KeyEvent(const KeyInput &key, ViewGroup *root);
-void TouchEvent(const TouchInput &touch, ViewGroup *root);
+bool TouchEvent(const TouchInput &touch, ViewGroup *root);
 void AxisEvent(const AxisInput &axis, ViewGroup *root);
 
 enum class UISound {

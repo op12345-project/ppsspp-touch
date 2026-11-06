@@ -75,6 +75,7 @@ protected:
 	Vec3 scale_ = Vec3(1.0f);
 	float alpha_ = 1.0f;
 	bool ignoreInput_ = false;
+	bool touchHandled_ = false;
 
 protected:
 	virtual void DrawBackground(UIContext &ui) {}

@@ -69,6 +69,7 @@ void UIScreen::DoRecreateViews() {
 }
 
 bool UIScreen::touch(const TouchInput &touch) {
+	touchHandled_ = false;
 	if (ClickDebug && root_ && (touch.flags & TouchInputFlags::DOWN)) {
 		INFO_LOG(Log::System, "Touch down!");
 		std::vector<UI::View *> views;
@@ -79,7 +80,7 @@ bool UIScreen::touch(const TouchInput &touch) {
 	}
 
 	if (!ignoreInput_ && root_) {
-		UI::TouchEvent(touch, root_);
+		touchHandled_ = UI::TouchEvent(touch, root_);
 	}
 	return true;
 }

@@ -582,6 +582,12 @@ public:
 	bool bStrictComboOrder;
 
 	bool bMouseControl;
+	bool bTouchNavigation;
+	bool bTF3LanguageProbe;
+	bool bTF3DuelProbe;
+	bool bTF3DuelHandInput;
+	bool bTF3DuelFieldInput;
+	int iTouchNavigationConfirmButton;
 	bool bMouseConfine; // Trap inside the window.
 	float fMouseSensitivity;
 	float fMouseSmoothing;

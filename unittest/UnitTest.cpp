@@ -40,6 +40,8 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstring>
+#include <limits>
 #include <algorithm>
 #include <memory>
 #include <cstdio>
@@ -125,6 +127,9 @@
 #include "Core/MemMap.h"
 #include "Core/KeyMap.h"
 #include "Core/ControlMapper.h"
+#include "UI/TouchNavigation.h"
+#include "UI/TagForce3LanguageSelection.h"
+#include "UI/TagForce3Duel.h"
 #include "Core/HLE/sceCtrl.h"
 #include "Core/HLE/sceUsbMic.h"
 #include "Core/Util/PathUtil.h"
@@ -3114,6 +3119,1861 @@ bool TestInputMapping() {
 	return true;
 }
 
+bool TestTouchNavigation() {
+	TouchNavigation navigation;
+	navigation.PointerDown(0, 10.0f, 10.0f, 0.0);
+	EXPECT_TRUE(navigation.PointerUp(0, 12.0f, 11.0f, 0.1) == TouchNavigationGesture::TAP);
+
+	const struct { float x, y; TouchNavigationGesture expected; } swipes[] = {
+		{ -60.0f, 0.0f, TouchNavigationGesture::LEFT },
+		{ 60.0f, 0.0f, TouchNavigationGesture::RIGHT },
+		{ 0.0f, -60.0f, TouchNavigationGesture::UP },
+		{ 0.0f, 60.0f, TouchNavigationGesture::DOWN },
+	};
+	for (const auto &swipe : swipes) {
+		navigation.PointerDown(0, 0.0f, 0.0f, 0.0);
+		navigation.PointerMove(0, swipe.x, swipe.y);
+		EXPECT_TRUE(navigation.PointerUp(0, swipe.x, swipe.y, 0.2) == swipe.expected);
+	}
+
+	navigation.PointerDown(0, 0.0f, 0.0f, 0.0);
+	navigation.PointerMove(0, 60.0f, 0.0f);
+	EXPECT_TRUE(navigation.PointerUp(0, 0.0f, 0.0f, 0.2) == TouchNavigationGesture::NONE);
+	navigation.PointerDown(0, 0.0f, 0.0f, 0.0);
+	navigation.CancelPointer();
+	EXPECT_TRUE(navigation.PointerUp(0, 0.0f, 0.0f, 0.1) == TouchNavigationGesture::NONE);
+	navigation.PointerDown(0, 0.0f, 0.0f, 0.0, true);
+	EXPECT_TRUE(navigation.PointerIsMouse());
+	EXPECT_TRUE(navigation.PointerUp(0, 0.0f, 0.0f, 0.5) == TouchNavigationGesture::NONE);
+
+	navigation.Queue(CTRL_UP);
+	navigation.Queue(CTRL_UP);
+	auto step = navigation.Update(0.0);
+	EXPECT_EQ_INT((int)step.press, (int)CTRL_UP);
+	EXPECT_EQ_INT((int)navigation.Update(0.04).release, 0);
+	step = navigation.Update(0.09);
+	EXPECT_EQ_INT((int)step.release, (int)CTRL_UP);
+	EXPECT_EQ_INT((int)navigation.Update(0.10).press, 0);
+	step = navigation.Update(0.12);
+	EXPECT_EQ_INT((int)step.press, (int)CTRL_UP);
+	EXPECT_EQ_INT((int)navigation.Reset(), (int)CTRL_UP);
+	EXPECT_EQ_INT((int)navigation.Update(1.0).press, 0);
+	return true;
+}
+
+// A fake ULES01183 v1.02 duel. Defaults to the first card selected in a settled six-card hand.
+struct FakeTF3Duel {
+	uint32_t cursorCode = 0x16;
+	uint32_t overlay = 1;
+	uint32_t ready = 1;
+	uint32_t promptFlags = 0x87;
+	uint32_t handCount = 6;
+	uint32_t targetFlag = 0;
+	uint32_t discardFlag = 0;
+	uint32_t handLimitA = 3;
+	uint32_t handLimitB = 2;
+	uint32_t handLimitC = 0;
+	uint32_t handLimitD = 0x100001;
+	float cursorX = -163.0f;
+
+	// The End Phase hand-limit discard prompt, as captured.
+	void SetHandLimitPrompt() {
+		handCount = 7;
+		cursorCode = 0x16;
+		cursorX = -195.0f;
+		promptFlags = 0xC7;
+		discardFlag = 1;
+		targetFlag = 0;
+		handLimitA = 4;
+		handLimitB = 1;
+		handLimitC = 1;
+		handLimitD = 0x800001;
+	}
+	const char *missingModule = "";
+	uint32_t wrongBase = 0;
+	uint32_t failAddress = 0;
+	uint32_t wrongNameAddress = 0;
+	int moduleQueries = 0;
+	int reads = 0;
+
+	TagForce3Duel::Snapshot Observe(const char *id = "ULES01183", const char *version = "1.02") {
+		auto isLoaded = [this](const char *name, uint32_t *base) {
+			++moduleQueries;
+			if (!strcmp(name, missingModule)) {
+				return false;
+			}
+			for (const TagForce3Duel::ExpectedModule &module : TagForce3Duel::EXPECTED_MODULES) {
+				if (!strcmp(name, module.name)) {
+					*base = wrongBase ? wrongBase : module.base;
+					return true;
+				}
+			}
+			return false;
+		};
+		auto readWord = [this](uint32_t address, uint32_t *value) {
+			using namespace TagForce3Duel;
+			++reads;
+			if (address == failAddress) {
+				return false;
+			}
+			for (const ExpectedModule &module : EXPECTED_MODULES) {
+				if (address >= module.nameAddress && address < module.nameAddress + 12) {
+					*value = address == wrongNameAddress ? 0 : module.nameWords[(address - module.nameAddress) / 4];
+					return true;
+				}
+			}
+			switch (address) {
+			case CURSOR_X_ADDRESS: memcpy(value, &cursorX, 4); return true;
+			case CURSOR_CODE_ADDRESS: *value = cursorCode; return true;
+			case PROMPT_FLAGS_ADDRESS: *value = promptFlags; return true;
+			case OVERLAY_ADDRESS: *value = overlay; return true;
+			case HAND_COUNT_ADDRESS: *value = handCount; return true;
+			case TARGET_FLAG_ADDRESS: *value = targetFlag; return true;
+			case COMMAND_READY_ADDRESS: *value = ready; return true;
+			case DISCARD_FLAG_ADDRESS: *value = discardFlag; return true;
+			case HAND_LIMIT_A_ADDRESS: *value = handLimitA; return true;
+			case HAND_LIMIT_B_ADDRESS: *value = handLimitB; return true;
+			case HAND_LIMIT_C_ADDRESS: *value = handLimitC; return true;
+			case HAND_LIMIT_D_ADDRESS: *value = handLimitD; return true;
+			default: return false;
+			}
+		};
+		return TagForce3Duel::Observe(id, version, isLoaded, readWord);
+	}
+};
+
+bool TestTagForce3Duel() {
+	using namespace TagForce3Duel;
+	// Module names really are these strings, read as little-endian words.
+	for (const ExpectedModule &module : EXPECTED_MODULES) {
+		EXPECT_EQ_INT(memcmp(module.nameWords, module.name, std::min(strlen(module.name) + 1, (size_t)12)), 0);
+	}
+
+	// Game and version: rejected without touching memory.
+	{
+		FakeTF3Duel duel;
+		EXPECT_TRUE(duel.Observe("ULES00600", "1.02").state == State::UNSUPPORTED_GAME);
+		EXPECT_TRUE(duel.Observe("ULES01183", "1.01").state == State::UNSUPPORTED_GAME);
+		EXPECT_TRUE(duel.Observe("ULES01183", "").state == State::UNSUPPORTED_GAME);
+		EXPECT_TRUE(duel.Observe("", "1.02").state == State::UNSUPPORTED_GAME);
+		EXPECT_EQ_INT(duel.reads + duel.moduleQueries, 0);
+	}
+
+	// Every captured settled position, with six, five, four, and seven cards.
+	const struct { int count; float x[7]; } layouts[] = {
+		{ 4, { -98.0f, -33.0f, 32.0f, 97.0f } },
+		{ 5, { -130.0f, -65.0f, 0.0f, 65.0f, 130.0f } },
+		{ 6, { -163.0f, -98.0f, -33.0f, 32.0f, 97.0f, 162.0f } },
+		{ 7, { -195.0f, -130.0f, -65.0f, 0.0f, 65.0f, 130.0f, 195.0f } },
+	};
+	for (const auto &layout : layouts) {
+		for (int i = 0; i < layout.count; ++i) {
+			EXPECT_EQ_FLOAT(SlotWorldX(i, layout.count), layout.x[i]);
+			FakeTF3Duel duel;
+			duel.handCount = layout.count;
+			duel.cursorCode = 0x16 + (i << 6);
+			duel.cursorX = layout.x[i];
+			Snapshot snapshot = duel.Observe();
+			EXPECT_TRUE(snapshot.state == State::HAND_SELECTION);
+			EXPECT_EQ_INT(snapshot.selectedIndex, i);
+		}
+	}
+
+	// Stale or missing modules.
+	{
+		for (const ExpectedModule &module : EXPECTED_MODULES) {
+			FakeTF3Duel missing;
+			missing.missingModule = module.name;
+			EXPECT_TRUE(missing.Observe().state == State::MODULES_NOT_LOADED);
+			FakeTF3Duel wrongName;
+			wrongName.wrongNameAddress = module.nameAddress + 8;
+			EXPECT_TRUE(wrongName.Observe().state == State::MODULES_NOT_LOADED);
+			FakeTF3Duel failedName;
+			failedName.failAddress = module.nameAddress;
+			EXPECT_TRUE(failedName.Observe().state == State::MODULES_NOT_LOADED);
+		}
+		FakeTF3Duel moved;
+		moved.wrongBase = 0x09000000;
+		EXPECT_TRUE(moved.Observe().state == State::MODULES_NOT_LOADED);
+	}
+
+	// Failed field reads.
+	for (uint32_t address : { CURSOR_X_ADDRESS, CURSOR_CODE_ADDRESS, PROMPT_FLAGS_ADDRESS, OVERLAY_ADDRESS,
+		HAND_COUNT_ADDRESS, TARGET_FLAG_ADDRESS, COMMAND_READY_ADDRESS, DISCARD_FLAG_ADDRESS,
+		HAND_LIMIT_A_ADDRESS, HAND_LIMIT_B_ADDRESS, HAND_LIMIT_C_ADDRESS, HAND_LIMIT_D_ADDRESS }) {
+		FakeTF3Duel duel;
+		duel.failAddress = address;
+		Snapshot snapshot = duel.Observe();
+		EXPECT_TRUE(snapshot.state == State::READ_FAILED);
+		EXPECT_EQ_INT(snapshot.selectedIndex, -1);
+	}
+
+	// States captured in the game, all of which have the cursor on a real hand card.
+	{
+		FakeTF3Duel menu;  // Summon / Set / Show Details, the phase selector, and Triangle's menu.
+		menu.overlay = 4;
+		EXPECT_TRUE(menu.Observe().state == State::OVERLAY_ACTIVE);
+		FakeTF3Duel banner;
+		banner.overlay = 6;
+		banner.ready = 0;
+		banner.promptFlags = 0x8F;
+		EXPECT_TRUE(banner.Observe().state == State::OVERLAY_ACTIVE);
+		FakeTF3Duel fieldCheck;
+		fieldCheck.overlay = 7;
+		EXPECT_TRUE(fieldCheck.Observe().state == State::OVERLAY_ACTIVE);
+		FakeTF3Duel results;
+		results.overlay = 0;
+		results.ready = 0;
+		results.promptFlags = 0x8F;
+		EXPECT_TRUE(results.Observe().state == State::OVERLAY_ACTIVE);
+		FakeTF3Duel opponentTurn;
+		opponentTurn.ready = 0;
+		opponentTurn.targetFlag = 1;
+		EXPECT_TRUE(opponentTurn.Observe().state == State::NOT_READY);
+		// The hand-limit prompt, for every slot, and everything that must not pass for it.
+		for (int i = 0; i < 7; ++i) {
+			FakeTF3Duel discard;
+			discard.SetHandLimitPrompt();
+			discard.cursorCode = 0x16 + (i << 6);
+			discard.cursorX = SlotWorldX(i, 7);
+			Snapshot snapshot = discard.Observe();
+			EXPECT_TRUE(snapshot.state == State::DISCARD_SELECTION);
+			EXPECT_EQ_INT(snapshot.selectedIndex, i);
+		}
+		// Lightning Vortex's cost: the same banner and discard flag, with the target flag.
+		FakeTF3Duel effect;
+		effect.handCount = 4;
+		effect.cursorCode = 0x16;
+		effect.cursorX = -98.0f;
+		effect.promptFlags = 0xC7;
+		effect.discardFlag = 1;
+		effect.targetFlag = 1;
+		EXPECT_TRUE(effect.Observe().state == State::EFFECT_DISCARD_PROMPT);
+		effect.SetHandLimitPrompt();
+		effect.targetFlag = 1;
+		EXPECT_TRUE(effect.Observe().state == State::EFFECT_DISCARD_PROMPT);
+		// The discard flag without the hand-limit fields.
+		FakeTF3Duel flagOnly;
+		flagOnly.handCount = 7;
+		flagOnly.cursorX = -195.0f;
+		flagOnly.promptFlags = 0xC7;
+		flagOnly.discardFlag = 1;
+		EXPECT_TRUE(flagOnly.Observe().state == State::UNKNOWN_PROMPT);
+		// Any one hand-limit field wrong.
+		for (int field = 0; field < 4; ++field) {
+			FakeTF3Duel partial;
+			partial.SetHandLimitPrompt();
+			uint32_t *fields[] = { &partial.handLimitA, &partial.handLimitB, &partial.handLimitC, &partial.handLimitD };
+			*fields[field] ^= 0x10;
+			EXPECT_TRUE(partial.Observe().state == State::UNKNOWN_PROMPT);
+		}
+		// The flag cleared, with all else matching.
+		FakeTF3Duel noFlag;
+		noFlag.SetHandLimitPrompt();
+		noFlag.discardFlag = 0;
+		EXPECT_TRUE(noFlag.Observe().state == State::UNKNOWN_PROMPT);
+		// A real prompt that can't be acted on: other sizes, the cursor elsewhere, mid-animation.
+		for (uint32_t count : { 4U, 5U, 6U, 8U, 9U }) {
+			FakeTF3Duel size;
+			size.SetHandLimitPrompt();
+			size.handCount = count;
+			size.cursorX = SlotWorldX(0, (int)count);
+			EXPECT_TRUE(size.Observe().state == State::DISCARD_PROMPT);
+		}
+		FakeTF3Duel away;
+		away.SetHandLimitPrompt();
+		away.cursorCode = 0x1A;
+		EXPECT_TRUE(away.Observe().state == State::DISCARD_PROMPT);
+		FakeTF3Duel moving;
+		moving.SetHandLimitPrompt();
+		moving.cursorX = -100.0f;
+		EXPECT_TRUE(moving.Observe().state == State::DISCARD_PROMPT);
+		moving.cursorX = std::numeric_limits<float>::quiet_NaN();
+		EXPECT_TRUE(moving.Observe().state == State::DISCARD_PROMPT);
+		// Not ready, or a menu over it.
+		FakeTF3Duel unready;
+		unready.SetHandLimitPrompt();
+		unready.ready = 0;
+		EXPECT_TRUE(unready.Observe().state == State::NOT_READY);
+		FakeTF3Duel covered;
+		covered.SetHandLimitPrompt();
+		covered.overlay = 4;
+		EXPECT_TRUE(covered.Observe().state == State::OVERLAY_ACTIVE);
+		// Attack target: the cursor can rest on a hand card with neither flag set.
+		FakeTF3Duel attack;
+		attack.handCount = 4;
+		attack.cursorCode = 0x96;
+		attack.cursorX = 32.0f;
+		attack.promptFlags = 0xC7;
+		EXPECT_TRUE(attack.Observe().state == State::UNKNOWN_PROMPT);
+		// Special Summon from the hand: yellow hand borders like discard, with the target flag.
+		FakeTF3Duel special;
+		special.handCount = 5;
+		special.cursorCode = 0xD6;
+		special.cursorX = 65.0f;
+		special.promptFlags = 0xC7;
+		special.targetFlag = 1;
+		EXPECT_TRUE(special.Observe().state == State::TARGET_PROMPT);
+		FakeTF3Duel target;
+		target.handCount = 4;
+		target.cursorCode = 0x96;
+		target.cursorX = 32.0f;
+		target.promptFlags = 0xC7;
+		target.targetFlag = 1;
+		EXPECT_TRUE(target.Observe().state == State::TARGET_PROMPT);
+		FakeTF3Duel neither;
+		neither.promptFlags = 0xC7;
+		EXPECT_TRUE(neither.Observe().state == State::UNKNOWN_PROMPT);
+		FakeTF3Duel both;
+		both.promptFlags = 0xC7;
+		both.targetFlag = 1;
+		both.discardFlag = 1;
+		EXPECT_TRUE(both.Observe().state == State::EFFECT_DISCARD_PROMPT);
+		FakeTF3Duel otherFlags;
+		otherFlags.promptFlags = 0x8F;
+		EXPECT_TRUE(otherFlags.Observe().state == State::UNKNOWN_PROMPT);
+	}
+
+	// Cursor location and bounds.
+	for (uint32_t code : { 0x00U, 0x0AU, 0x1AU, 0xD7U, 0x1FU }) {
+		FakeTF3Duel duel;
+		duel.cursorCode = code;
+		EXPECT_TRUE(duel.Observe().state == State::CURSOR_NOT_IN_HAND);
+	}
+	for (uint32_t code : { 0x181B1F1BU, 0x20U, 0x3FU, 0x4AU }) {
+		FakeTF3Duel duel;
+		duel.cursorCode = code;
+		EXPECT_TRUE(duel.Observe().state == State::INVALID_CURSOR);
+	}
+	{
+		FakeTF3Duel onePast;
+		onePast.cursorCode = 0x16 + (6 << 6);
+		EXPECT_TRUE(onePast.Observe().state == State::INVALID_CURSOR);
+		FakeTF3Duel highBits;
+		highBits.cursorCode = 0x80000016;
+		EXPECT_TRUE(highBits.Observe().state == State::INVALID_CURSOR);
+	}
+
+	// Hand sizes without a measured layout.
+	for (uint32_t count : { 0U, 1U, 2U, 3U, 8U, 9U, 60U, 0xFFFFFFFFU }) {
+		FakeTF3Duel duel;
+		duel.handCount = count;
+		EXPECT_TRUE(duel.Observe().state == State::UNSUPPORTED_HAND_SIZE);
+	}
+
+	// Mid-reflow: the rightmost of five read 115 before settling at 130.
+	{
+		FakeTF3Duel duel;
+		duel.handCount = 5;
+		duel.cursorCode = 0x16 + (4 << 6);
+		duel.cursorX = 115.0f;
+		EXPECT_TRUE(duel.Observe().state == State::LAYOUT_NOT_SETTLED);
+		duel.cursorX = 130.0f;
+		EXPECT_TRUE(duel.Observe().state == State::HAND_SELECTION);
+		duel.cursorX = std::numeric_limits<float>::quiet_NaN();
+		EXPECT_TRUE(duel.Observe().state == State::LAYOUT_NOT_SETTLED);
+	}
+
+	// Centers against measured selection frames, to within the fit's error.
+	const struct { int count, index; float left, right; } frames[] = {
+		{ 4, 0, 215.25f, 268.25f }, { 4, 3, 358.5f, 411.5f },
+		{ 5, 0, 191.75f, 244.75f }, { 5, 4, 382.75f, 435.75f },
+		{ 6, 0, 167.75f, 220.5f }, { 6, 5, 406.5f, 459.25f },
+		{ 7, 1, 191.75f, 244.75f }, { 7, 5, 382.75f, 435.75f },
+	};
+	for (const auto &frame : frames) {
+		EXPECT_TRUE(fabsf(SlotCenterPspX(frame.index, frame.count) - (frame.left + frame.right) * 0.5f) < 0.5f);
+	}
+
+	// A one-reading flicker of ready must never reach HAND_SELECTION.
+	{
+		FakeTF3Duel duel;
+		Snapshot raw = duel.Observe();
+		StabilityGate gate;
+		EXPECT_TRUE(gate.Apply(raw, 100).state == State::SETTLING);
+		EXPECT_EQ_INT(gate.Apply(raw, 100).selectedIndex, -1);
+		EXPECT_EQ_INT(HitTest(gate.Apply(raw, 102), SlotCenterPspX(0, 6), 240.0f, 0.0f, 0.0f, 480.0f, 272.0f), -1);
+		EXPECT_TRUE(gate.Apply(raw, 100 + STABLE_VBLANKS - 1).state == State::SETTLING);
+		Snapshot stable = gate.Apply(raw, 100 + STABLE_VBLANKS);
+		EXPECT_TRUE(stable.state == State::HAND_SELECTION);
+		EXPECT_EQ_INT(stable.selectedIndex, 0);
+		EXPECT_EQ_INT(HitTest(stable, SlotCenterPspX(0, 6), 240.0f, 0.0f, 0.0f, 480.0f, 272.0f), 0);
+
+		// Cursor moves keep it stable; any other state restarts it.
+		duel.cursorCode = 0x56;
+		duel.cursorX = -98.0f;
+		raw = duel.Observe();
+		EXPECT_EQ_INT(gate.Apply(raw, 200).selectedIndex, 1);
+		duel.ready = 0;
+		Snapshot notReady = duel.Observe();
+		EXPECT_TRUE(gate.Apply(notReady, 201).state == State::NOT_READY);
+		EXPECT_TRUE(gate.Apply(raw, 202).state == State::SETTLING);
+		EXPECT_TRUE(gate.Apply(raw, 202 + STABLE_VBLANKS).state == State::HAND_SELECTION);
+
+		// So does a changed hand size, even if the rest looks settled.
+		duel = FakeTF3Duel();
+		duel.handCount = 5;
+		duel.cursorCode = 0x16;
+		duel.cursorX = -130.0f;
+		EXPECT_TRUE(gate.Apply(duel.Observe(), 300).state == State::SETTLING);
+		EXPECT_TRUE(gate.Apply(duel.Observe(), 300 + STABLE_VBLANKS).state == State::HAND_SELECTION);
+
+		// A savestate can move the counter backward.
+		EXPECT_TRUE(gate.Apply(duel.Observe(), 50).state == State::SETTLING);
+		EXPECT_TRUE(gate.Apply(duel.Observe(), 50 + STABLE_VBLANKS).state == State::HAND_SELECTION);
+		gate.Reset();
+		EXPECT_TRUE(gate.Apply(duel.Observe(), 1000).state == State::SETTLING);
+	}
+
+	// Hit test in the game's frame, for every validated size and selection.
+	for (int count = 4; count <= 7; ++count) {
+		for (int selected = 0; selected < count; ++selected) {
+			Snapshot snapshot;
+			snapshot.state = State::HAND_SELECTION;
+			snapshot.handCount = count;
+			snapshot.selectedIndex = selected;
+			for (int i = 0; i < count; ++i) {
+				float cx = SlotCenterPspX(i, count);
+				if (cx >= 480.0f) {
+					continue;
+				}
+				EXPECT_EQ_INT(HitTest(snapshot, cx, 240.0f, 0.0f, 0.0f, 480.0f, 272.0f), i);
+				// The raised area belongs only to the selected card.
+				EXPECT_EQ_INT(HitTest(snapshot, cx, 210.0f, 0.0f, 0.0f, 480.0f, 272.0f), i == selected ? i : -1);
+			}
+			float cx = SlotCenterPspX(selected, count);
+			EXPECT_EQ_INT(HitTest(snapshot, cx, 200.9f, 0.0f, 0.0f, 480.0f, 272.0f), -1);
+			EXPECT_EQ_INT(HitTest(snapshot, cx, 272.0f, 0.0f, 0.0f, 480.0f, 272.0f), -1);
+		}
+	}
+	Snapshot six;
+	six.state = State::HAND_SELECTION;
+	six.handCount = 6;
+	six.selectedIndex = 0;
+	// Beyond both ends of the row, and inside the left-hand info panel.
+	EXPECT_EQ_INT(HitTest(six, SlotCenterPspX(0, 6) - SELECTED_HALF_WIDTH - 0.5f, 240.0f, 0.0f, 0.0f, 480.0f, 272.0f), -1);
+	EXPECT_EQ_INT(HitTest(six, SlotCenterPspX(5, 6) + SLOT_HALF_WIDTH + 0.5f, 240.0f, 0.0f, 0.0f, 480.0f, 272.0f), -1);
+	EXPECT_EQ_INT(HitTest(six, 60.0f, 240.0f, 0.0f, 0.0f, 480.0f, 272.0f), -1);
+	// The widened selected card wins where it overlaps a neighbor.
+	EXPECT_EQ_INT(HitTest(six, SlotCenterPspX(0, 6) + SELECTED_HALF_WIDTH - 0.5f, 240.0f, 0.0f, 0.0f, 480.0f, 272.0f), 0);
+	six.selectedIndex = 3;
+	EXPECT_EQ_INT(HitTest(six, SlotCenterPspX(0, 6) + SLOT_HALF_WIDTH + 0.5f, 240.0f, 0.0f, 0.0f, 480.0f, 272.0f), 1);
+	// The field above the hand isn't a card.
+	EXPECT_EQ_INT(HitTest(six, SlotCenterPspX(0, 6), 218.9f, 0.0f, 0.0f, 480.0f, 272.0f), -1);
+	// Seven cards: the last overhangs the screen, and only its visible part can be hit.
+	Snapshot seven;
+	seven.state = State::HAND_SELECTION;
+	seven.handCount = 7;
+	seven.selectedIndex = 0;
+	EXPECT_EQ_INT(HitTest(seven, 470.0f, 240.0f, 0.0f, 0.0f, 480.0f, 272.0f), 6);
+	EXPECT_EQ_INT(HitTest(seven, 480.0f, 240.0f, 0.0f, 0.0f, 480.0f, 272.0f), -1);
+
+	// Viewport scaling and letterboxing, in the sizes measured in the game.
+	const struct { float x, y, w, h; } viewports[] = {
+		{ 0.0f, 0.0f, 2161.0f, 1224.0f },  // 16:9 at 150% DPI.
+		{ 0.0f, 175.0f, 1501.0f, 850.0f }, // Letterboxed 5:4.
+		{ 0.0f, 79.0f, 978.0f, 554.0f },   // Letterboxed.
+		{ 420.0f, 0.0f, 1440.0f, 816.0f }, // Pillarboxed.
+	};
+	six.selectedIndex = 2;
+	for (const auto &view : viewports) {
+		const float sx = view.w / 480.0f;
+		const float sy = view.h / 272.0f;
+		for (int i = 0; i < 6; ++i) {
+			float x = view.x + SlotCenterPspX(i, 6) * sx;
+			EXPECT_EQ_INT(HitTest(six, x, view.y + 240.0f * sy, view.x, view.y, view.w, view.h), i);
+		}
+		float x = view.x + SlotCenterPspX(2, 6) * sx;
+		// Black bars.
+		EXPECT_EQ_INT(HitTest(six, x, view.y + view.h + 1.0f, view.x, view.y, view.w, view.h), -1);
+		EXPECT_EQ_INT(HitTest(six, view.x - 1.0f, view.y + 240.0f * sy, view.x, view.y, view.w, view.h), -1);
+	}
+	EXPECT_EQ_INT(HitTest(six, 240.0f, 240.0f, 0.0f, 0.0f, 0.0f, 272.0f), -1);
+	EXPECT_EQ_INT(HitTest(six, 240.0f, 240.0f, 0.0f, 0.0f, 480.0f, 0.0f), -1);
+
+	// Only a verified state produces a slot, whatever the snapshot's other fields say.
+	for (State state : { State::UNSUPPORTED_GAME, State::MODULES_NOT_LOADED, State::READ_FAILED, State::OVERLAY_ACTIVE,
+		State::NOT_READY, State::DISCARD_PROMPT, State::EFFECT_DISCARD_PROMPT, State::TARGET_PROMPT, State::UNKNOWN_PROMPT,
+		State::UNSUPPORTED_HAND_SIZE, State::INVALID_CURSOR, State::LAYOUT_NOT_SETTLED, State::SETTLING }) {
+		Snapshot rejected = six;
+		rejected.state = state;
+		EXPECT_EQ_INT(HitTest(rejected, SlotCenterPspX(2, 6), 240.0f, 0.0f, 0.0f, 480.0f, 272.0f), -1);
+		EXPECT_TRUE(strlen(StateName(state)) > 0);
+	}
+	for (int count : { 0, 3, 8 }) {
+		EXPECT_EQ_INT(HitTestSlot(240.0f, 240.0f, count, 0), -1);
+	}
+	EXPECT_EQ_INT(HitTestSlot(240.0f, 240.0f, 6, -2), -1);
+	EXPECT_EQ_INT(HitTestSlot(240.0f, 240.0f, 6, 6), -1);
+
+	// The states that can be acted on also hit-test. No card is raised with the cursor on the board.
+	Snapshot board;
+	board.state = State::CURSOR_NOT_IN_HAND;
+	board.handCount = 6;
+	EXPECT_EQ_INT(HitTest(board, SlotCenterPspX(2, 6), 240.0f, 0.0f, 0.0f, 480.0f, 272.0f), 2);
+	EXPECT_EQ_INT(HitTest(board, SlotCenterPspX(2, 6), 210.0f, 0.0f, 0.0f, 480.0f, 272.0f), -1);
+	Snapshot discardHit;
+	discardHit.state = State::DISCARD_SELECTION;
+	discardHit.handCount = 7;
+	discardHit.selectedIndex = 1;
+	EXPECT_EQ_INT(HitTest(discardHit, SlotCenterPspX(3, 7), 240.0f, 0.0f, 0.0f, 480.0f, 272.0f), 3);
+	discardHit.selectedIndex = -1;
+	EXPECT_EQ_INT(HitTest(discardHit, SlotCenterPspX(3, 7), 240.0f, 0.0f, 0.0f, 480.0f, 272.0f), -1);
+
+	// The discard state is gated like the others, and passing into it restarts the count.
+	{
+		StabilityGate gate;
+		FakeTF3Duel normal;
+		normal.handCount = 7;
+		normal.cursorX = -195.0f;
+		EXPECT_TRUE(gate.Apply(normal.Observe(), 0).state == State::SETTLING);
+		EXPECT_TRUE(gate.Apply(normal.Observe(), STABLE_VBLANKS).state == State::HAND_SELECTION);
+		normal.cursorCode = 0x1A;
+		EXPECT_TRUE(gate.Apply(normal.Observe(), STABLE_VBLANKS + 1).state == State::CURSOR_NOT_IN_HAND);
+		normal.cursorCode = 0x16;
+		EXPECT_TRUE(gate.Apply(normal.Observe(), STABLE_VBLANKS + 2).state == State::HAND_SELECTION);
+		FakeTF3Duel discard;
+		discard.SetHandLimitPrompt();
+		EXPECT_TRUE(gate.Apply(discard.Observe(), 100).state == State::SETTLING);
+		EXPECT_EQ_INT(gate.Apply(discard.Observe(), 100).selectedIndex, -1);
+		EXPECT_TRUE(gate.Apply(discard.Observe(), 100 + STABLE_VBLANKS).state == State::DISCARD_SELECTION);
+	}
+	return true;
+}
+
+// A small model of the duel cursor, driven only through the planner's named buttons. Records every
+// press and release, and what was selected when X went down.
+struct SimTF3Hand {
+	using Planner = TagForce3Duel::HandActionPlanner;
+	using Button = Planner::Button;
+	static constexpr int MOVE_DELAY = 4;  // Vblanks from press to the cursor moving, as measured.
+
+	TagForce3Duel::State state = TagForce3Duel::State::HAND_SELECTION;
+	int handCount = 6;
+	int index = 0;
+	int boardSteps = 0;  // Downs left before the cursor reaches the hand.
+	uint32_t boardCode = 0x1A;
+	bool moves = true;
+	uint64_t vblanks = 1000;
+	double wall = 100.0;
+	bool focused = true;
+	bool paused = false;
+	bool otherInput = false;
+	uint32_t serial = 0;
+	Planner planner;
+
+	Button held = Button::NONE;
+	int moveIn = -1;
+	Button moving = Button::NONE;
+	int presses = 0;
+	int releases = 0;
+	int crosses = 0;
+	int crossIndex = -1;
+	int directions = 0;
+	bool doubleHeld = false;
+	bool badRelease = false;
+	bool crossWhileMoving = false;
+
+	Planner::Context Context() const {
+		Planner::Context context;
+		context.snapshot.state = state;
+		context.snapshot.handCount = handCount;
+		const bool inHand = state == TagForce3Duel::State::HAND_SELECTION || state == TagForce3Duel::State::DISCARD_SELECTION;
+		context.snapshot.selectedIndex = inHand ? index : -1;
+		context.snapshot.cursorCode = inHand ? 0x16 + (index << 6) : boardCode;
+		context.focused = focused;
+		context.paused = paused;
+		context.otherInput = otherInput;
+		context.stateSerial = serial;
+		context.vblanks = vblanks;
+		context.wallTime = wall;
+		return context;
+	}
+
+	void Tick() {
+		++vblanks;
+		wall += 1.0 / 60.0;
+		if (moveIn > 0 && --moveIn == 0) {
+			if (moves) {
+				if (moving == Button::RIGHT) {
+					index = (index + 1) % handCount;
+				} else if (moving == Button::LEFT) {
+					index = (index + handCount - 1) % handCount;
+				} else if (moving == Button::DOWN) {
+					if (boardSteps > 1) {
+						--boardSteps;
+						boardCode += 2;
+					} else {
+						boardSteps = 0;
+						state = TagForce3Duel::State::HAND_SELECTION;
+					}
+				}
+			}
+			moving = Button::NONE;
+		}
+		Planner::Step step = planner.Update(Context());
+		if (step.release != Button::NONE) {
+			if (step.release != held) {
+				badRelease = true;
+			}
+			held = Button::NONE;
+			++releases;
+		}
+		if (step.press != Button::NONE) {
+			if (held != Button::NONE) {
+				doubleHeld = true;
+			}
+			held = step.press;
+			++presses;
+			if (step.press == Button::CROSS) {
+				++crosses;
+				crossIndex = index;
+				crossWhileMoving = moving != Button::NONE;
+			} else {
+				++directions;
+				moving = step.press;
+				moveIn = MOVE_DELAY;
+			}
+		}
+	}
+
+	void Run(int count) {
+		for (int i = 0; i < count; ++i) {
+			Tick();
+		}
+	}
+
+	bool Clean() const {
+		return held == Button::NONE && presses == releases && !doubleHeld && !badRelease && !crossWhileMoving;
+	}
+};
+
+bool TestTagForce3DuelInput() {
+	using namespace TagForce3Duel;
+	using Planner = HandActionPlanner;
+	using Tap = Planner::TapResult;
+	using Reason = Planner::CancelReason;
+
+	// One tap reaches every card from every card by the shortest wrapped path, without X.
+	for (int count = 4; count <= 7; ++count) {
+		for (int from = 0; from < count; ++from) {
+			for (int to = 0; to < count; ++to) {
+				if (from == to) {
+					continue;
+				}
+				SimTF3Hand sim;
+				sim.handCount = count;
+				sim.index = from;
+				EXPECT_TRUE(sim.planner.Tap(to, sim.Context()) == Tap::NAVIGATING);
+				sim.Run(150);
+				EXPECT_EQ_INT(sim.index, to);
+				EXPECT_EQ_INT(sim.crosses, 0);
+				EXPECT_FALSE(sim.planner.Active());
+				EXPECT_TRUE(sim.Clean());
+				const int forward = (to - from + count) % count;
+				EXPECT_EQ_INT(sim.directions, std::min(forward, count - forward));
+			}
+		}
+	}
+
+	// A tap on the selected card sends one X and no direction, and another while it lands is ignored.
+	{
+		SimTF3Hand sim;
+		sim.index = 3;
+		EXPECT_TRUE(sim.planner.Tap(3, sim.Context()) == Tap::CONFIRMING);
+		EXPECT_TRUE(sim.planner.Tap(3, sim.Context()) == Tap::CONFIRM_ADDED);
+		sim.Run(10);
+		EXPECT_EQ_INT(sim.crosses, 1);
+		EXPECT_TRUE(sim.planner.Tap(3, sim.Context()) == Tap::REJECTED);
+		sim.Run(20);
+		EXPECT_TRUE(sim.planner.Tap(3, sim.Context()) == Tap::REJECTED);
+		EXPECT_EQ_INT(sim.crosses, 1);
+		EXPECT_EQ_INT(sim.crossIndex, 3);
+		EXPECT_EQ_INT(sim.directions, 0);
+		EXPECT_TRUE(sim.Clean());
+		// With the game not reacting, the cooldown does end. X is never repeated by itself.
+		sim.Run(100);
+		EXPECT_FALSE(sim.planner.Active());
+		EXPECT_EQ_INT(sim.crosses, 1);
+	}
+
+	// The cooldown ends as soon as the game reacts, and the menu state then rejects taps.
+	{
+		SimTF3Hand sim;
+		EXPECT_TRUE(sim.planner.Tap(0, sim.Context()) == Tap::CONFIRMING);
+		sim.Run(10);
+		sim.state = State::OVERLAY_ACTIVE;
+		sim.Run(1);
+		EXPECT_FALSE(sim.planner.Active());
+		EXPECT_TRUE(sim.planner.Tap(0, sim.Context()) == Tap::REJECTED);
+		EXPECT_EQ_INT(sim.crosses, 1);
+	}
+
+	// Double tap on another card: X only once the selection is verified there.
+	for (int to : { 1, 3, 5 }) {
+		SimTF3Hand sim;
+		EXPECT_TRUE(sim.planner.Tap(to, sim.Context()) == Tap::NAVIGATING);
+		sim.Run(2);
+		EXPECT_TRUE(sim.planner.Tap(to, sim.Context()) == Tap::CONFIRM_ADDED);
+		sim.Run(150);
+		EXPECT_EQ_INT(sim.index, to);
+		EXPECT_EQ_INT(sim.crosses, 1);
+		EXPECT_EQ_INT(sim.crossIndex, to);
+		EXPECT_TRUE(sim.Clean());
+	}
+
+	// The second tap landing after a short move finished is the same as tapping the selected card.
+	{
+		SimTF3Hand sim;
+		sim.planner.Tap(1, sim.Context());
+		sim.Run(30);
+		EXPECT_EQ_INT(sim.index, 1);
+		EXPECT_FALSE(sim.planner.Active());
+		EXPECT_TRUE(sim.planner.Tap(1, sim.Context()) == Tap::CONFIRMING);
+		sim.Run(10);
+		EXPECT_EQ_INT(sim.crosses, 1);
+		EXPECT_EQ_INT(sim.crossIndex, 1);
+	}
+
+	// X is withheld while the state isn't stable, and then the whole action is dropped.
+	{
+		SimTF3Hand sim;
+		sim.planner.Tap(2, sim.Context());
+		sim.planner.Tap(2, sim.Context());
+		sim.Run(2);
+		sim.state = State::SETTLING;
+		sim.Run(1);
+		EXPECT_FALSE(sim.planner.Active());
+		EXPECT_TRUE(sim.planner.LastCancel() == Reason::STATE_CHANGED);
+		sim.state = State::HAND_SELECTION;
+		sim.Run(100);
+		EXPECT_EQ_INT(sim.crosses, 0);
+		EXPECT_TRUE(sim.held == SimTF3Hand::Button::NONE);
+	}
+	// Reaching the card and then losing readiness before X also drops it. Each state in turn.
+	for (State state : { State::NOT_READY, State::OVERLAY_ACTIVE, State::TARGET_PROMPT, State::EFFECT_DISCARD_PROMPT,
+		State::DISCARD_PROMPT, State::DISCARD_SELECTION, State::UNKNOWN_PROMPT, State::LAYOUT_NOT_SETTLED, State::SETTLING,
+		State::CURSOR_NOT_IN_HAND, State::MODULES_NOT_LOADED, State::READ_FAILED, State::UNSUPPORTED_GAME, State::UNSUPPORTED_HAND_SIZE }) {
+		SimTF3Hand sim;
+		sim.index = 1;
+		sim.planner.Tap(1, sim.Context());
+		sim.state = state;
+		sim.Run(100);
+		EXPECT_EQ_INT(sim.crosses, 0);
+		EXPECT_FALSE(sim.planner.Active());
+		EXPECT_TRUE(sim.Clean());
+	}
+
+	// Taps are refused outright in anything but the three actionable states.
+	for (State state : { State::UNSUPPORTED_GAME, State::MODULES_NOT_LOADED, State::READ_FAILED, State::OVERLAY_ACTIVE,
+		State::NOT_READY, State::DISCARD_PROMPT, State::EFFECT_DISCARD_PROMPT, State::TARGET_PROMPT, State::UNKNOWN_PROMPT,
+		State::UNSUPPORTED_HAND_SIZE, State::INVALID_CURSOR, State::LAYOUT_NOT_SETTLED, State::SETTLING }) {
+		SimTF3Hand sim;
+		sim.state = state;
+		EXPECT_TRUE(sim.planner.Tap(0, sim.Context()) == Tap::REJECTED);
+		sim.Run(60);
+		EXPECT_EQ_INT(sim.presses, 0);
+	}
+	{
+		SimTF3Hand sim;
+		EXPECT_TRUE(sim.planner.Tap(-1, sim.Context()) == Tap::REJECTED);
+		EXPECT_TRUE(sim.planner.Tap(6, sim.Context()) == Tap::REJECTED);
+		sim.otherInput = true;
+		EXPECT_TRUE(sim.planner.Tap(1, sim.Context()) == Tap::REJECTED);
+		sim.otherInput = false;
+		sim.focused = false;
+		EXPECT_TRUE(sim.planner.Tap(1, sim.Context()) == Tap::REJECTED);
+		sim.focused = true;
+		sim.paused = true;
+		EXPECT_TRUE(sim.planner.Tap(1, sim.Context()) == Tap::REJECTED);
+	}
+
+	// Each cancellation releases the held direction at once, and no X follows.
+	struct Cancel {
+		void (*apply)(SimTF3Hand &);
+		Reason reason;
+	};
+	const Cancel cancels[] = {
+		{ [](SimTF3Hand &sim) { sim.focused = false; }, Reason::FOCUS },
+		{ [](SimTF3Hand &sim) { sim.paused = true; }, Reason::PAUSED },
+		{ [](SimTF3Hand &sim) { sim.serial++; }, Reason::STATE_LOAD },
+		{ [](SimTF3Hand &sim) { sim.otherInput = true; }, Reason::OTHER_INPUT },
+		{ [](SimTF3Hand &sim) { sim.vblanks -= 500; }, Reason::CLOCK },
+		{ [](SimTF3Hand &sim) { sim.wall += 10.0; }, Reason::TIMEOUT },
+		{ [](SimTF3Hand &sim) { sim.state = State::NOT_READY; }, Reason::STATE_CHANGED },
+		{ [](SimTF3Hand &sim) { sim.handCount = 5; }, Reason::HAND_CHANGED },
+	};
+	for (const Cancel &cancel : cancels) {
+		SimTF3Hand sim;
+		sim.planner.Tap(3, sim.Context());
+		sim.planner.Tap(3, sim.Context());
+		sim.Run(2);
+		EXPECT_TRUE(sim.held == SimTF3Hand::Button::RIGHT || sim.held == SimTF3Hand::Button::LEFT);
+		cancel.apply(sim);
+		sim.Run(1);
+		EXPECT_TRUE(sim.held == SimTF3Hand::Button::NONE);
+		EXPECT_FALSE(sim.planner.Active());
+		EXPECT_TRUE(sim.planner.LastCancel() == cancel.reason);
+		sim.Run(100);
+		EXPECT_EQ_INT(sim.crosses, 0);
+		EXPECT_EQ_INT(sim.presses, 1);
+		EXPECT_TRUE(sim.Clean());
+	}
+	// Asked to stop by the screen (focus, a key, a virtual button).
+	{
+		SimTF3Hand sim;
+		sim.planner.Tap(3, sim.Context());
+		sim.Run(2);
+		Planner::Step step = sim.planner.Cancel(Reason::OTHER_INPUT);
+		EXPECT_TRUE(step.release != SimTF3Hand::Button::NONE);
+		EXPECT_FALSE(sim.planner.Active());
+	}
+
+	// Cross down is released even if everything goes away while it's held.
+	{
+		SimTF3Hand sim;
+		sim.planner.Tap(0, sim.Context());
+		sim.Run(3);
+		EXPECT_TRUE(sim.held == SimTF3Hand::Button::CROSS);
+		sim.focused = false;
+		sim.Run(1);
+		EXPECT_TRUE(sim.held == SimTF3Hand::Button::NONE);
+		EXPECT_TRUE(sim.Clean());
+	}
+	// While it's held the game may react: not a cancel, and it's held for the full pulse.
+	{
+		SimTF3Hand sim;
+		sim.planner.Tap(0, sim.Context());
+		sim.Run(3);
+		sim.state = State::OVERLAY_ACTIVE;
+		sim.Run(10);
+		EXPECT_EQ_INT(sim.crosses, 1);
+		EXPECT_TRUE(sim.Clean());
+	}
+
+	// The cursor moved by something else, including a move in the wrong direction.
+	{
+		SimTF3Hand sim;
+		sim.planner.Tap(3, sim.Context());
+		sim.planner.Tap(3, sim.Context());
+		sim.Run(2);
+		sim.index = 5;
+		sim.moves = false;
+		sim.Run(100);
+		EXPECT_FALSE(sim.planner.Active());
+		EXPECT_TRUE(sim.planner.LastCancel() == Reason::CURSOR);
+		EXPECT_EQ_INT(sim.crosses, 0);
+		EXPECT_TRUE(sim.Clean());
+	}
+	// The cursor not responding at all times out rather than repeating presses.
+	{
+		SimTF3Hand sim;
+		sim.moves = false;
+		sim.planner.Tap(3, sim.Context());
+		sim.planner.Tap(3, sim.Context());
+		sim.Run(200);
+		EXPECT_FALSE(sim.planner.Active());
+		EXPECT_EQ_INT(sim.presses, 1);
+		EXPECT_EQ_INT(sim.crosses, 0);
+		EXPECT_TRUE(sim.Clean());
+	}
+
+	// Another card mid-flight redirects, keeps the press balanced, and drops a pending X.
+	{
+		SimTF3Hand sim;
+		sim.planner.Tap(2, sim.Context());
+		sim.planner.Tap(2, sim.Context());
+		sim.Run(2);
+		EXPECT_TRUE(sim.planner.Tap(4, sim.Context()) == Tap::RETARGETED);
+		sim.Run(150);
+		EXPECT_EQ_INT(sim.index, 4);
+		EXPECT_EQ_INT(sim.crosses, 0);
+		EXPECT_TRUE(sim.Clean());
+		// Back onto where the cursor just was: it must not wander off.
+		SimTF3Hand back;
+		back.planner.Tap(2, back.Context());
+		back.Run(12);
+		const int reached = back.index;
+		back.planner.Tap(reached, back.Context());
+		back.Run(150);
+		EXPECT_EQ_INT(back.index, reached);
+		EXPECT_TRUE(back.Clean());
+	}
+
+	// Cursor on the board, as at the start of a turn: Down into the hand, then across, with checks.
+	for (int steps : { 1, 2, 5 }) {
+		SimTF3Hand sim;
+		sim.state = State::CURSOR_NOT_IN_HAND;
+		sim.boardSteps = steps;
+		sim.index = 2;
+		EXPECT_TRUE(sim.planner.Tap(4, sim.Context()) == Tap::NAVIGATING);
+		EXPECT_TRUE(sim.planner.Tap(4, sim.Context()) == Tap::CONFIRM_ADDED);
+		sim.Run(170);
+		EXPECT_TRUE(sim.state == State::HAND_SELECTION);
+		EXPECT_EQ_INT(sim.index, 4);
+		EXPECT_EQ_INT(sim.crosses, 1);
+		EXPECT_EQ_INT(sim.crossIndex, 4);
+		EXPECT_TRUE(sim.Clean());
+	}
+	{
+		// Entering lands on the target already.
+		SimTF3Hand sim;
+		sim.state = State::CURSOR_NOT_IN_HAND;
+		sim.boardSteps = 1;
+		sim.index = 2;
+		sim.planner.Tap(2, sim.Context());
+		sim.Run(60);
+		EXPECT_EQ_INT(sim.index, 2);
+		EXPECT_EQ_INT(sim.crosses, 0);
+		EXPECT_FALSE(sim.planner.Active());
+		EXPECT_TRUE(sim.Clean());
+		// A cursor that won't move: one Down, then nothing.
+		SimTF3Hand stuck;
+		stuck.state = State::CURSOR_NOT_IN_HAND;
+		stuck.boardSteps = 3;
+		stuck.moves = false;
+		stuck.planner.Tap(1, stuck.Context());
+		stuck.Run(120);
+		EXPECT_FALSE(stuck.planner.Active());
+		EXPECT_EQ_INT(stuck.presses, 1);
+		EXPECT_TRUE(stuck.planner.LastCancel() == Reason::CURSOR);
+		EXPECT_TRUE(stuck.Clean());
+		// A cursor moved by something else while waiting to press.
+		SimTF3Hand moved;
+		moved.state = State::CURSOR_NOT_IN_HAND;
+		moved.planner.Tap(1, moved.Context());
+		moved.boardCode = 0x02;
+		moved.Run(5);
+		EXPECT_FALSE(moved.planner.Active());
+		EXPECT_EQ_INT(moved.presses, 0);
+		EXPECT_TRUE(moved.planner.LastCancel() == Reason::CURSOR);
+		// More rows than the board has.
+		SimTF3Hand endless;
+		endless.state = State::CURSOR_NOT_IN_HAND;
+		endless.boardSteps = 50;
+		endless.planner.Tap(1, endless.Context());
+		endless.Run(180);
+		EXPECT_FALSE(endless.planner.Active());
+		EXPECT_TRUE(endless.presses <= 6);
+		EXPECT_TRUE(endless.Clean());
+	}
+
+	// Hand-limit discard: one tap on any card moves there and sends exactly one X.
+	for (int to = 0; to < 7; ++to) {
+		SimTF3Hand sim;
+		sim.state = State::DISCARD_SELECTION;
+		sim.handCount = 7;
+		sim.index = 2;
+		EXPECT_TRUE(sim.planner.Tap(to, sim.Context()) == Tap::CONFIRMING);
+		sim.Run(150);
+		EXPECT_EQ_INT(sim.index, to);
+		EXPECT_EQ_INT(sim.crosses, 1);
+		EXPECT_EQ_INT(sim.crossIndex, to);
+		EXPECT_TRUE(sim.Clean());
+	}
+	// A discard can't be redirected or doubled.
+	{
+		SimTF3Hand sim;
+		sim.state = State::DISCARD_SELECTION;
+		sim.handCount = 7;
+		sim.planner.Tap(3, sim.Context());
+		sim.Run(2);
+		EXPECT_TRUE(sim.planner.Tap(5, sim.Context()) == Tap::REJECTED);
+		EXPECT_TRUE(sim.planner.Tap(3, sim.Context()) == Tap::REJECTED);
+		sim.Run(150);
+		EXPECT_EQ_INT(sim.index, 3);
+		EXPECT_EQ_INT(sim.crosses, 1);
+		EXPECT_TRUE(sim.Clean());
+	}
+	// The prompt going away on the way to a card leaves it undiscarded.
+	for (State state : { State::TARGET_PROMPT, State::EFFECT_DISCARD_PROMPT, State::HAND_SELECTION, State::NOT_READY, State::SETTLING, State::DISCARD_PROMPT }) {
+		SimTF3Hand sim;
+		sim.state = State::DISCARD_SELECTION;
+		sim.handCount = 7;
+		sim.planner.Tap(3, sim.Context());
+		sim.Run(2);
+		sim.state = state;
+		sim.Run(100);
+		EXPECT_EQ_INT(sim.crosses, 0);
+		EXPECT_FALSE(sim.planner.Active());
+		EXPECT_TRUE(sim.Clean());
+	}
+	// A normal action doesn't turn into a discard if the prompt appears partway.
+	{
+		SimTF3Hand sim;
+		sim.handCount = 7;
+		sim.planner.Tap(3, sim.Context());
+		sim.planner.Tap(3, sim.Context());
+		sim.Run(2);
+		sim.state = State::DISCARD_SELECTION;
+		sim.Run(100);
+		EXPECT_EQ_INT(sim.crosses, 0);
+		EXPECT_TRUE(sim.planner.LastCancel() == Reason::STATE_CHANGED);
+	}
+
+	// The cursor core still behaves without wrapping, as the language menu needs.
+	{
+		CursorPlanner cursor;
+		EXPECT_TRUE(cursor.Start(0, 4, 5, false, 4, 0.0));
+		EXPECT_TRUE(cursor.Update(true, 0, 0.0).press == CursorDirection::NEXT);
+		EXPECT_FALSE(cursor.Start(0, 5, 5, false, 4, 0.0));
+		EXPECT_FALSE(cursor.Start(5, 0, 5, false, 4, 0.0));
+		EXPECT_TRUE(cursor.Start(1, 1, 5, false, 4, 0.0));
+		EXPECT_FALSE(cursor.Active());
+		EXPECT_TRUE(cursor.Start(4, 0, 5, true, 5, 0.0));
+		EXPECT_TRUE(cursor.Update(true, 4, 0.0).press == CursorDirection::NEXT);
+		EXPECT_TRUE(cursor.Cancel().release == CursorDirection::NEXT);
+	}
+	return true;
+}
+
+// A fake ULES01183 v1.02 board, from the 2026-11-06 captures. Defaults to Main Phase 1 of
+// `two_monsters`: the cursor on the player's monster in screen column 4 (zone 0x06), two player
+// monsters and one opponent monster.
+struct FakeTF3Field {
+	uint32_t cursorCode = 0x06;
+	uint32_t column = 4;
+	uint32_t row = 4;
+	uint32_t overlay = 1;
+	uint32_t ready = 1;
+	uint32_t promptFlags = 0x87;
+	uint32_t attack = 0;
+	uint32_t card = 0;
+	uint32_t dialog = 0;
+	uint32_t anim = 0;
+	uint32_t anim2 = 0;
+	float cursorX = 105.0f;
+	uint32_t cards[TagForce3Duel::FIELD_ZONES] = {};
+	uint32_t failAddress = 0;
+	int reads = 0;
+	bool handCountRead = false;
+
+	FakeTF3Field() {
+		cards[0x04] = 0x070014C6;
+		cards[0x06] = 0x020010A6;
+		cards[0x05] = 0x04805C29;
+	}
+	void SetTarget(bool attackTarget) {
+		promptFlags = 0xC7;
+		attack = attackTarget ? 1 : 0;
+		card = attackTarget ? 0 : 1;
+		anim = anim2 = 3;
+	}
+	void SetCursor(uint32_t code, uint32_t r, uint32_t c) {
+		cursorCode = code;
+		row = r;
+		column = c;
+	}
+
+	TagForce3Duel::FieldSnapshot Observe(const char *id = "ULES01183", const char *version = "1.02") {
+		using namespace TagForce3Duel;
+		auto isLoaded = [](const char *name, uint32_t *base) {
+			for (const ExpectedModule &module : EXPECTED_MODULES) {
+				if (!strcmp(name, module.name)) {
+					*base = module.base;
+					return true;
+				}
+			}
+			return false;
+		};
+		auto readWord = [this](uint32_t address, uint32_t *value) {
+			using namespace TagForce3Duel;
+			++reads;
+			if (address == failAddress) {
+				return false;
+			}
+			handCountRead |= address == HAND_COUNT_ADDRESS;
+			for (const ExpectedModule &module : EXPECTED_MODULES) {
+				if (address >= module.nameAddress && address < module.nameAddress + 12) {
+					*value = module.nameWords[(address - module.nameAddress) / 4];
+					return true;
+				}
+			}
+			for (uint32_t zone = 0; zone < (uint32_t)FIELD_ZONES; ++zone) {
+				if (address == FieldEntryAddress(zone)) {
+					*value = cards[zone];
+					return true;
+				}
+			}
+			switch (address) {
+			case CURSOR_X_ADDRESS: memcpy(value, &cursorX, 4); return true;
+			case CURSOR_CODE_ADDRESS: *value = cursorCode; return true;
+			case CURSOR_COLUMN_ADDRESS: *value = column; return true;
+			case CURSOR_ROW_ADDRESS: *value = row; return true;
+			case PROMPT_FLAGS_ADDRESS: *value = promptFlags; return true;
+			case OVERLAY_ADDRESS: *value = overlay; return true;
+			case COMMAND_READY_ADDRESS: *value = ready; return true;
+			case SELECT_ATTACK_ADDRESS: *value = attack; return true;
+			case SELECT_CARD_ADDRESS: *value = card; return true;
+			case SELECT_DIALOG_ADDRESS: *value = dialog; return true;
+			case SELECT_ANIM_ADDRESS: *value = anim; return true;
+			case SELECT_ANIM2_ADDRESS: *value = anim2; return true;
+			default: return false;
+			}
+		};
+		return ObserveField(id, version, isLoaded, readWord);
+	}
+};
+
+bool TestTagForce3DuelField() {
+	using namespace TagForce3Duel;
+
+	// Zone map: the game's row and column words for every zone reached in a live walk.
+	{
+		const struct { uint32_t zone; int row, column; } walked[] = {
+			{ 0x00, 4, 1 }, { 0x01, 2, 5 }, { 0x02, 4, 2 }, { 0x03, 2, 4 }, { 0x04, 4, 3 }, { 0x05, 2, 3 },
+			{ 0x06, 4, 4 }, { 0x07, 2, 2 }, { 0x08, 4, 5 }, { 0x09, 2, 1 }, { 0x0A, 5, 1 }, { 0x0B, 1, 5 },
+			{ 0x0C, 5, 2 }, { 0x0D, 1, 4 }, { 0x0E, 5, 3 }, { 0x0F, 1, 3 }, { 0x10, 5, 4 }, { 0x11, 1, 2 },
+			{ 0x12, 5, 5 }, { 0x13, 1, 1 }, { 0x14, 4, 0 }, { 0x15, 2, 6 }, { 0x18, 5, 0 }, { 0x19, 1, 6 },
+			{ 0x1A, 5, 6 }, { 0x1B, 1, 0 }, { 0x1C, 4, 6 }, { 0x1D, 2, 0 }, { 0x1E, 3, 6 }, { 0x1F, 3, 0 },
+		};
+		for (const auto &w : walked) {
+			int row = -1;
+			int column = -1;
+			EXPECT_TRUE(ZoneGridPosition(w.zone, &row, &column));
+			EXPECT_EQ_INT(row, w.row);
+			EXPECT_EQ_INT(column, w.column);
+		}
+		int row = 0;
+		int column = 0;
+		EXPECT_FALSE(ZoneGridPosition(0x16, &row, &column));
+		EXPECT_FALSE(ZoneGridPosition(0x17, &row, &column));
+		EXPECT_FALSE(ZoneGridPosition(0x20, &row, &column));
+		// Table entries checked against captures.
+		EXPECT_EQ_INT(FieldEntryAddress(0x04), 0x09E2A584);
+		EXPECT_EQ_INT(FieldEntryAddress(0x06), 0x09E2A598);
+		EXPECT_EQ_INT(FieldEntryAddress(0x05), 0x09E2B0C0);
+		EXPECT_EQ_INT(FieldEntryAddress(0x0E), 0x09E2A5E8);
+		EXPECT_EQ_INT(FieldEntryAddress(0x0F), 0x09E2B124);
+	}
+
+	// Geometry: each measured rectangle's center hits its own zone, for both players.
+	for (uint32_t zone = 0; zone < (uint32_t)FIELD_ZONES; ++zone) {
+		ZoneRect rect;
+		EXPECT_TRUE(FieldZoneRect(zone, &rect));
+		EXPECT_EQ_INT(FieldZoneAt((rect.x1 + rect.x2) * 0.5f, (rect.y1 + rect.y2) * 0.5f), (int)zone);
+	}
+	{
+		ZoneRect rect;
+		EXPECT_FALSE(FieldZoneRect(0x14, &rect));
+		EXPECT_FALSE(FieldZoneRect(0x1A, &rect));
+		EXPECT_EQ_INT(FieldZoneAt(313.0f, 132.0f), -1);   // Phase bar between the two sides.
+		EXPECT_EQ_INT(FieldZoneAt(170.0f, 190.0f), -1);   // Left of the board.
+		EXPECT_EQ_INT(FieldZoneAt(313.0f, 240.0f), -1);   // Hand row.
+		EXPECT_EQ_INT(FieldZoneAt(313.0f, 40.0f), -1);    // Opponent hand.
+		// Overlapping edges of slanted tiles go to the nearer center.
+		EXPECT_EQ_INT(FieldZoneAt(241.0f, 190.0f), 0x0A);
+		EXPECT_EQ_INT(FieldZoneAt(244.0f, 190.0f), 0x0C);
+	}
+
+	// Disc and version: nothing read.
+	{
+		FakeTF3Field field;
+		EXPECT_TRUE(field.Observe("ULES01183", "1.01").state == FieldState::UNSUPPORTED_GAME);
+		EXPECT_TRUE(field.Observe("ULES00600", "1.02").state == FieldState::UNSUPPORTED_GAME);
+		EXPECT_EQ_INT(field.reads, 0);
+	}
+
+	// Normal play, with occupancy for both players and no dependence on the hand size.
+	{
+		FakeTF3Field field;
+		FieldSnapshot snapshot = field.Observe();
+		EXPECT_TRUE(snapshot.state == FieldState::NORMAL);
+		EXPECT_EQ_INT(snapshot.OccupiedMask(), (1 << 0x04) | (1 << 0x05) | (1 << 0x06));
+		EXPECT_FALSE(field.handCountRead);
+		field.cards[0x0F] = 0x0C005D17;  // The opponent's face-down Spell/Trap.
+		EXPECT_EQ_INT(field.Observe().OccupiedMask() & (1 << 0x0F), 1 << 0x0F);
+		// Hand cursor (any size) and the opponent's hand are normal board states too.
+		field.SetCursor(0xD6, 6, 0);
+		field.cursorX = 97.0f;
+		EXPECT_TRUE(field.Observe().state == FieldState::NORMAL);
+		field.SetCursor(0x57, 0, 3);
+		EXPECT_TRUE(field.Observe().state == FieldState::NORMAL);
+		field.SetCursor(0x1A, 5, 6);  // Deck.
+		EXPECT_TRUE(field.Observe().state == FieldState::NORMAL);
+	}
+
+	// Target prompts as captured.
+	{
+		FakeTF3Field attack;
+		attack.SetTarget(true);
+		attack.SetCursor(0x05, 2, 3);
+		EXPECT_TRUE(attack.Observe().state == FieldState::ATTACK_TARGET);
+		attack.SetCursor(0x0C, 5, 2);  // The cursor roams the whole board in this prompt.
+		EXPECT_TRUE(attack.Observe().state == FieldState::ATTACK_TARGET);
+		FakeTF3Field equip;
+		equip.SetTarget(false);
+		equip.SetCursor(0x96, 6, 0);
+		equip.cursorX = 32.0f;
+		EXPECT_TRUE(equip.Observe().state == FieldState::CARD_TARGET);
+		equip.SetCursor(0x04, 4, 3);
+		EXPECT_TRUE(equip.Observe().state == FieldState::CARD_TARGET);
+	}
+
+	// Rejected: dialogs, menus, the opponent's turn, the hand-limit prompt, and anything unexpected.
+	{
+		FakeTF3Field dialog;  // "Check card details?" during the opponent's turn.
+		dialog.dialog = 1;
+		dialog.overlay = 4;
+		dialog.ready = 0;
+		EXPECT_TRUE(dialog.Observe().state == FieldState::DIALOG);
+		FakeTF3Field menu;  // Show Details on a field card.
+		menu.overlay = 4;
+		EXPECT_TRUE(menu.Observe().state == FieldState::OVERLAY_ACTIVE);
+		FakeTF3Field menuInTarget;  // Show Details opened from inside the attack prompt.
+		menuInTarget.SetTarget(true);
+		menuInTarget.overlay = 4;
+		EXPECT_TRUE(menuInTarget.Observe().state == FieldState::OVERLAY_ACTIVE);
+		FakeTF3Field opponent;
+		opponent.ready = 0;
+		EXPECT_TRUE(opponent.Observe().state == FieldState::NOT_READY);
+		FakeTF3Field handLimit;
+		handLimit.promptFlags = 0xC7;
+		handLimit.SetCursor(0x16, 6, 0);
+		handLimit.cursorX = -195.0f;
+		EXPECT_TRUE(handLimit.Observe().state == FieldState::HAND_PROMPT);
+		FakeTF3Field both;
+		both.SetTarget(true);
+		both.card = 1;
+		EXPECT_TRUE(both.Observe().state == FieldState::UNKNOWN_PROMPT);
+		FakeTF3Field oddFlag;
+		oddFlag.attack = 2;
+		EXPECT_TRUE(oddFlag.Observe().state == FieldState::UNKNOWN_PROMPT);
+		FakeTF3Field noPrompt;
+		noPrompt.SetTarget(true);
+		noPrompt.promptFlags = 0x87;
+		EXPECT_TRUE(noPrompt.Observe().state == FieldState::UNKNOWN_PROMPT);
+		FakeTF3Field cutIn;
+		cutIn.promptFlags = 0x8F;
+		EXPECT_TRUE(cutIn.Observe().state == FieldState::UNKNOWN_PROMPT);
+	}
+
+	// A prompt opening (anim 1 for about 0.5 s, seen on a fresh boot), and the two animation words
+	// disagreeing for a moment while it opens or closes.
+	{
+		FakeTF3Field opening;
+		opening.SetTarget(false);
+		opening.anim = opening.anim2 = 1;
+		EXPECT_TRUE(opening.Observe().state == FieldState::TRANSITION);
+		opening.anim2 = 3;
+		EXPECT_TRUE(opening.Observe().state == FieldState::TRANSITION);
+		FakeTF3Field split;
+		split.anim = 4;
+		split.anim2 = 0;
+		EXPECT_TRUE(split.Observe().state == FieldState::TRANSITION);
+		split.attack = 2;
+		EXPECT_TRUE(split.Observe().state == FieldState::UNKNOWN_PROMPT);
+	}
+
+	// After a target is confirmed: anim steps 3, 4, 2, 0, and ready can return before it ends.
+	{
+		for (uint32_t anim : { 4u, 2u, 1u }) {
+			FakeTF3Field closing;
+			closing.anim = closing.anim2 = anim;
+			EXPECT_TRUE(closing.Observe().state == FieldState::TRANSITION);
+			FakeTF3Field closingTarget;
+			closingTarget.SetTarget(true);
+			closingTarget.anim = closingTarget.anim2 = anim;
+			EXPECT_TRUE(closingTarget.Observe().state == FieldState::TRANSITION);
+		}
+		FakeTF3Field committed;  // First reading after Cross on the target: ready 0, prompt back to normal.
+		committed.SetTarget(true);
+		committed.ready = 0;
+		committed.promptFlags = 0x87;
+		EXPECT_TRUE(committed.Observe().state == FieldState::NOT_READY);
+	}
+
+	// Cursor words that disagree with the zone map.
+	{
+		FakeTF3Field field;
+		field.column = 3;
+		EXPECT_TRUE(field.Observe().state == FieldState::INVALID_CURSOR);
+		field.SetCursor(0x06 | (1 << 6), 4, 4);
+		EXPECT_TRUE(field.Observe().state == FieldState::INVALID_CURSOR);
+		field.SetCursor(0x16, 4, 0);
+		EXPECT_TRUE(field.Observe().state == FieldState::INVALID_CURSOR);
+		field.SetCursor(0x20, 4, 0);
+		EXPECT_TRUE(field.Observe().state == FieldState::INVALID_CURSOR);
+		field.SetCursor(0x16, 6, 0);
+		field.cursorX = std::numeric_limits<float>::quiet_NaN();
+		EXPECT_TRUE(field.Observe().state == FieldState::INVALID_CURSOR);
+	}
+
+	// Any failed read.
+	{
+		std::vector<uint32_t> addresses = { CURSOR_X_ADDRESS, CURSOR_CODE_ADDRESS, CURSOR_COLUMN_ADDRESS, CURSOR_ROW_ADDRESS,
+			PROMPT_FLAGS_ADDRESS, OVERLAY_ADDRESS, COMMAND_READY_ADDRESS, SELECT_ATTACK_ADDRESS, SELECT_CARD_ADDRESS,
+			SELECT_DIALOG_ADDRESS, SELECT_ANIM_ADDRESS, SELECT_ANIM2_ADDRESS };
+		for (uint32_t zone = 0; zone < (uint32_t)FIELD_ZONES; ++zone) {
+			addresses.push_back(FieldEntryAddress(zone));
+		}
+		for (uint32_t address : addresses) {
+			FakeTF3Field field;
+			field.failAddress = address;
+			FieldSnapshot snapshot = field.Observe();
+			EXPECT_TRUE(snapshot.state == FieldState::READ_FAILED);
+			EXPECT_FALSE(snapshot.cardsValid);
+		}
+		FakeTF3Field module;
+		module.failAddress = EXPECTED_MODULES[1].nameAddress;
+		EXPECT_TRUE(module.Observe().state == FieldState::MODULES_NOT_LOADED);
+	}
+
+	// Stability gate.
+	{
+		FakeTF3Field field;
+		FieldStabilityGate gate;
+		FieldSnapshot normal = field.Observe();
+		EXPECT_TRUE(gate.Apply(normal, 100).state == FieldState::SETTLING);
+		EXPECT_TRUE(gate.Apply(normal, 111).state == FieldState::SETTLING);
+		EXPECT_TRUE(gate.Apply(normal, 112).state == FieldState::NORMAL);
+		// Cursor moves don't restart it.
+		field.SetCursor(0x05, 2, 3);
+		EXPECT_TRUE(gate.Apply(field.Observe(), 113).state == FieldState::NORMAL);
+		// A board change does.
+		field.cards[0x08] = 0x02001234;
+		EXPECT_TRUE(gate.Apply(field.Observe(), 114).state == FieldState::SETTLING);
+		EXPECT_TRUE(gate.Apply(field.Observe(), 126).state == FieldState::NORMAL);
+		// So does a state change, and a two-vblank flicker of an actionable state.
+		field.SetTarget(true);
+		EXPECT_TRUE(gate.Apply(field.Observe(), 127).state == FieldState::SETTLING);
+		FakeTF3Field busy;
+		busy.ready = 0;
+		EXPECT_TRUE(gate.Apply(busy.Observe(), 128).state == FieldState::NOT_READY);
+		EXPECT_TRUE(gate.Apply(normal, 129).state == FieldState::SETTLING);
+		EXPECT_TRUE(gate.Apply(normal, 131).state == FieldState::SETTLING);
+		EXPECT_TRUE(gate.Apply(busy.Observe(), 132).state == FieldState::NOT_READY);
+		EXPECT_TRUE(gate.Apply(normal, 133).state == FieldState::SETTLING);
+		// A transition resets it.
+		EXPECT_TRUE(gate.Apply(normal, 145).state == FieldState::NORMAL);
+		FakeTF3Field closing;
+		closing.anim = closing.anim2 = 4;
+		EXPECT_TRUE(gate.Apply(closing.Observe(), 146).state == FieldState::TRANSITION);
+		EXPECT_TRUE(gate.Apply(normal, 147).state == FieldState::SETTLING);
+		// A savestate takes the counter backward.
+		EXPECT_TRUE(gate.Apply(normal, 200).state == FieldState::NORMAL);
+		EXPECT_TRUE(gate.Apply(normal, 50).state == FieldState::SETTLING);
+	}
+
+	// Hit test through the viewport: plain 2x, letterboxed (978x554 at y 79), and pillarboxed.
+	{
+		FakeTF3Field field;
+		const FieldSnapshot snapshot = field.Observe();
+		const struct { float x, y, w, h; } viewports[] = {
+			{ 0.0f, 0.0f, 960.0f, 544.0f }, { 0.0f, 79.0f, 978.0f, 554.0f }, { 160.0f, 0.0f, 640.0f, 362.67f },
+		};
+		for (const auto &v : viewports) {
+			auto toScreen = [&](float gx, float gy, float *x, float *y) {
+				*x = v.x + gx * v.w / 480.0f;
+				*y = v.y + gy * v.h / 272.0f;
+			};
+			for (uint32_t zone = 0; zone < (uint32_t)FIELD_ZONES; ++zone) {
+				ZoneRect rect;
+				EXPECT_TRUE(FieldZoneRect(zone, &rect));
+				float x = 0.0f;
+				float y = 0.0f;
+				toScreen((rect.x1 + rect.x2) * 0.5f, (rect.y1 + rect.y2) * 0.5f, &x, &y);
+				FieldHit hit = HitTestField(snapshot, -1, x, y, v.x, v.y, v.w, v.h);
+				EXPECT_EQ_INT(hit.zone, (int)zone);
+				const bool occupied = zone == 0x04 || zone == 0x05 || zone == 0x06;
+				EXPECT_EQ_INT(hit.occupied, occupied);
+				EXPECT_EQ_INT(hit.card, field.cards[zone]);
+				EXPECT_TRUE(hit.accepted);
+			}
+			// Outside the game frame.
+			EXPECT_EQ_INT(HitTestField(snapshot, -1, v.x - 2.0f, v.y + 10.0f, v.x, v.y, v.w, v.h).zone, -1);
+			EXPECT_EQ_INT(HitTestField(snapshot, -1, v.x + 10.0f, v.y - 2.0f, v.x, v.y, v.w, v.h).zone, -1);
+		}
+		// Not actionable: the zone and its card are still reported, but not accepted.
+		FakeTF3Field menu;
+		menu.overlay = 4;
+		FieldHit hit = HitTestField(menu.Observe(), -1, 313.5f * 2.0f, 157.0f * 2.0f, 0.0f, 0.0f, 960.0f, 544.0f);
+		EXPECT_EQ_INT(hit.zone, 0x04);
+		EXPECT_TRUE(hit.occupied);
+		EXPECT_FALSE(hit.accepted);
+		FieldSnapshot settling = field.Observe();
+		settling.state = FieldState::SETTLING;
+		EXPECT_FALSE(HitTestField(settling, -1, 627.0f, 314.0f, 0.0f, 0.0f, 960.0f, 544.0f).accepted);
+	}
+
+	// The raised hand card covers the bottom of the player's S/T row; the hand wins there.
+	{
+		FakeTF3Field field;
+		field.SetCursor(0x96, 6, 0);  // Third of four cards: world X 32, PSP center 337.3.
+		field.cursorX = 32.0f;
+		const FieldSnapshot snapshot = field.Observe();
+		auto at = [&](float gx, float gy, int handSlot = -1) {
+			return HitTestField(snapshot, handSlot, gx, gy, 0.0f, 0.0f, 480.0f, 272.0f).zone;
+		};
+		EXPECT_EQ_INT(at(340.0f, 205.0f), -1);    // Under the raised card.
+		EXPECT_EQ_INT(at(312.0f, 205.0f), -1);
+		EXPECT_EQ_INT(at(250.0f, 205.0f), 0x0C);  // Same strip, clear of the card.
+		EXPECT_EQ_INT(at(340.0f, 195.0f), 0x10);  // Above the raised card.
+		EXPECT_EQ_INT(at(250.0f, 195.0f, 2), -1); // The hand claimed the point.
+		// With the cursor on the board, nothing is raised.
+		FakeTF3Field board;
+		const FieldSnapshot onBoard = board.Observe();
+		EXPECT_EQ_INT(HitTestField(onBoard, -1, 340.0f, 205.0f, 0.0f, 0.0f, 480.0f, 272.0f).zone, 0x10);
+		// An eight-card hand isn't measured, but the raised card still comes from the cursor's X.
+		field.cursorX = 130.0f;
+		const FieldSnapshot eight = field.Observe();
+		EXPECT_TRUE(eight.state == FieldState::NORMAL);
+		EXPECT_EQ_INT(HitTestField(eight, -1, 409.0f, 205.0f, 0.0f, 0.0f, 480.0f, 272.0f).zone, -1);
+		EXPECT_EQ_INT(HitTestField(eight, -1, 409.0f, 195.0f, 0.0f, 0.0f, 480.0f, 272.0f).zone, 0x12);
+	}
+	return true;
+}
+
+// Simulates the duel cursor the way it was seen to move: rows wrap through seven positions, columns
+// 1-5 run straight, leaving the hand lands on `handColumn`, and a press acts once on its first vblank.
+struct FakeTF3FieldGame {
+	uint32_t cursorCode = 0x16;
+	int handColumn = 4;
+	TagForce3Duel::FieldButton held = TagForce3Duel::FieldButton::NONE;
+	bool acted = false;
+	bool ignorePresses = false;
+	bool wrongWay = false;
+	int presses = 0;
+	uint32_t cards[TagForce3Duel::FIELD_ZONES] = {};
+	TagForce3Duel::FieldState state = TagForce3Duel::FieldState::NORMAL;
+
+	static uint32_t ZoneAt(int row, int column) {
+		for (uint32_t zone = 0; zone < 0x20; ++zone) {
+			int r = 0;
+			int c = 0;
+			if (TagForce3Duel::ZoneGridPosition(zone, &r, &c) && r == row && c == column) {
+				return zone;
+			}
+		}
+		return 0xFF;
+	}
+
+	void Move(TagForce3Duel::FieldButton button) {
+		using TagForce3Duel::FieldButton;
+		if (wrongWay) {
+			button = button == FieldButton::LEFT ? FieldButton::RIGHT : button == FieldButton::RIGHT ? FieldButton::LEFT : button;
+		}
+		int row = 0;
+		int column = 0;
+		TagForce3Duel::CursorGridPosition(cursorCode, &row, &column);
+		if (row == 6) {
+			if (button == FieldButton::UP) {
+				cursorCode = ZoneAt(5, handColumn);
+			}
+			return;
+		}
+		if (row == 0) {
+			if (button == FieldButton::DOWN) {
+				cursorCode = ZoneAt(1, 3);
+			}
+			return;
+		}
+		if (button == FieldButton::LEFT || button == FieldButton::RIGHT) {
+			if (row == 3) {
+				cursorCode = 0x08;  // As seen from 0x1E.
+				return;
+			}
+			cursorCode = ZoneAt(row, (column + (button == FieldButton::RIGHT ? 1 : 6)) % 7);
+			return;
+		}
+		static const int SIDE[5] = { 1, 2, 3, 4, 5 };
+		static const int MIDDLE[4] = { 1, 2, 4, 5 };
+		const int *rows = (column == 0 || column == 6) ? SIDE : MIDDLE;
+		const int count = (column == 0 || column == 6) ? 5 : 4;
+		int i = 0;
+		while (rows[i] != row) {
+			++i;
+		}
+		if (button == FieldButton::UP) {
+			cursorCode = i == 0 ? (0x17 | (1 << 6)) : ZoneAt(rows[i - 1], column);
+		} else {
+			cursorCode = i == count - 1 ? (0x16 | (2 << 6)) : ZoneAt(rows[i + 1], column);
+		}
+	}
+
+	void Apply(const TagForce3Duel::FieldActionPlanner::Step &step) {
+		if (step.release != TagForce3Duel::FieldButton::NONE && step.release == held) {
+			held = TagForce3Duel::FieldButton::NONE;
+		}
+		if (step.press != TagForce3Duel::FieldButton::NONE) {
+			held = step.press;
+			acted = false;
+			++presses;
+		}
+	}
+
+	void Vblank() {
+		if (held != TagForce3Duel::FieldButton::NONE && !acted) {
+			acted = true;
+			if (!ignorePresses) {
+				Move(held);
+			}
+		}
+	}
+
+	TagForce3Duel::FieldSnapshot Snapshot() const {
+		TagForce3Duel::FieldSnapshot snapshot;
+		snapshot.state = state;
+		snapshot.cursorCode = cursorCode;
+		int row = 0;
+		int column = 0;
+		TagForce3Duel::CursorGridPosition(cursorCode, &row, &column);
+		snapshot.row = row;
+		snapshot.column = column < 0 ? 0 : column;
+		snapshot.overlay = 1;
+		snapshot.ready = 1;
+		snapshot.promptFlags = 0x87;
+		memcpy(snapshot.cards, cards, sizeof(cards));
+		snapshot.cardsValid = true;
+		return snapshot;
+	}
+};
+
+bool TestTagForce3DuelFieldInput() {
+	using namespace TagForce3Duel;
+	using Planner = FieldActionPlanner;
+	auto context = [](const FakeTF3FieldGame &game, uint64_t vblanks) {
+		Planner::Context c;
+		c.snapshot = game.Snapshot();
+		c.focused = true;
+		c.vblanks = vblanks;
+		c.wallTime = vblanks / 60.0;
+		return c;
+	};
+	// Runs until the planner stops; returns false if it never does. Fails if a button stays held.
+	auto run = [&](Planner &planner, FakeTF3FieldGame &game, uint64_t *vblanks, int limit = 400) {
+		for (int i = 0; i < limit; ++i) {
+			game.Vblank();
+			game.Apply(planner.Update(context(game, *vblanks)));
+			++*vblanks;
+			if (!planner.Active()) {
+				return game.held == FieldButton::NONE;
+			}
+		}
+		return false;
+	};
+
+	// Planned moves for the transitions seen in the game.
+	{
+		FieldMove move;
+		EXPECT_TRUE(PlanFieldMove(0xD6, 0x05, &move));  // Hand: Up, any column of row 5.
+		EXPECT_TRUE(move.button == FieldButton::UP && move.row == 5 && move.column == -1);
+		EXPECT_TRUE(PlanFieldMove(0x57, 0x04, &move));  // Opponent hand: Down into row 1.
+		EXPECT_TRUE(move.button == FieldButton::DOWN && move.row == 1);
+		EXPECT_TRUE(PlanFieldMove(0x1E, 0x04, &move));  // Middle pile: leave downward.
+		EXPECT_TRUE(move.button == FieldButton::DOWN && move.row == 4 && move.column == 6);
+		EXPECT_TRUE(PlanFieldMove(0x1A, 0x0A, &move));  // Deck to the far left: wraps right.
+		EXPECT_TRUE(move.button == FieldButton::RIGHT && move.row == 5 && move.column == 0);
+		EXPECT_TRUE(PlanFieldMove(0x0E, 0x0F, &move));  // Same column, opponent S/T: up.
+		EXPECT_TRUE(move.button == FieldButton::UP && move.row == 4 && move.column == 3);
+		EXPECT_TRUE(PlanFieldMove(0x05, 0x0E, &move));
+		EXPECT_TRUE(move.button == FieldButton::DOWN && move.row == 4 && move.column == 3);
+		EXPECT_FALSE(PlanFieldMove(0x05, 0x05, &move));
+		EXPECT_FALSE(PlanFieldMove(0x05, 0x14, &move));  // Piles are never targets.
+		EXPECT_FALSE(PlanFieldMove(0x05, 0x16, &move));
+	}
+
+	// Every card zone on both sides, from the hand, the deck, both hands, the middle piles, and
+	// every other card zone. No Cross exists in this planner; check every move landed as predicted.
+	{
+		std::vector<uint32_t> starts = { 0x16 | (3 << 6), 0x17 | (1 << 6), 0x1A, 0x18, 0x1B, 0x19, 0x1E, 0x1F, 0x14, 0x15 };
+		for (uint32_t zone = 0; zone < (uint32_t)FIELD_ZONES; ++zone) {
+			starts.push_back(zone);
+		}
+		int maxSteps = 0;
+		for (uint32_t start : starts) {
+			for (uint32_t target = 0; target < (uint32_t)FIELD_ZONES; ++target) {
+				for (int handColumn : { 1, 3, 5 }) {
+					FakeTF3FieldGame game;
+					game.cursorCode = start;
+					game.handColumn = handColumn;
+					for (uint32_t &card : game.cards) {
+						card = 0x1234;
+					}
+					Planner planner;
+					uint64_t vblanks = 1000;
+					const Planner::TapResult result = planner.Tap((int)target, context(game, vblanks));
+					if ((start & 0x3F) == target) {
+						EXPECT_TRUE(result == Planner::TapResult::ALREADY_SELECTED);
+						EXPECT_FALSE(planner.Active());
+						continue;
+					}
+					EXPECT_TRUE(result == Planner::TapResult::NAVIGATING);
+					EXPECT_TRUE(run(planner, game, &vblanks));
+					EXPECT_EQ_INT((int)(game.cursorCode & 0x3F), (int)target);
+					EXPECT_TRUE(planner.LastCancel() == Planner::CancelReason::NONE);
+					EXPECT_EQ_INT(planner.Steps(), game.presses);
+					maxSteps = std::max(maxSteps, planner.Steps());
+				}
+			}
+		}
+		EXPECT_TRUE(maxSteps <= 8);
+	}
+
+	// Rejections: empty zone, piles, unsettled or non-normal states, and unusable contexts.
+	{
+		FakeTF3FieldGame game;
+		game.cards[0x05] = 0x04805C29;
+		Planner planner;
+		EXPECT_TRUE(planner.Tap(0x07, context(game, 0)) == Planner::TapResult::REJECTED);  // Empty.
+		EXPECT_TRUE(planner.Tap(0x14, context(game, 0)) == Planner::TapResult::REJECTED);
+		EXPECT_TRUE(planner.Tap(-1, context(game, 0)) == Planner::TapResult::REJECTED);
+		for (FieldState state : { FieldState::SETTLING, FieldState::ATTACK_TARGET, FieldState::CARD_TARGET, FieldState::TRANSITION,
+			FieldState::DIALOG, FieldState::NOT_READY, FieldState::HAND_PROMPT, FieldState::UNKNOWN_PROMPT, FieldState::INVALID_CURSOR }) {
+			game.state = state;
+			EXPECT_TRUE(planner.Tap(0x05, context(game, 0)) == Planner::TapResult::REJECTED);
+		}
+		game.state = FieldState::NORMAL;
+		Planner::Context c = context(game, 0);
+		c.focused = false;
+		EXPECT_TRUE(planner.Tap(0x05, c) == Planner::TapResult::REJECTED);
+		c = context(game, 0);
+		c.paused = true;
+		EXPECT_TRUE(planner.Tap(0x05, c) == Planner::TapResult::REJECTED);
+		c = context(game, 0);
+		c.otherInput = true;
+		EXPECT_TRUE(planner.Tap(0x05, c) == Planner::TapResult::REJECTED);
+		c = context(game, 0);
+		c.snapshot.cardsValid = false;
+		EXPECT_TRUE(planner.Tap(0x05, c) == Planner::TapResult::REJECTED);
+		EXPECT_FALSE(planner.Active());
+		EXPECT_TRUE(planner.Tap(0x05, context(game, 0)) == Planner::TapResult::NAVIGATING);
+		EXPECT_TRUE(planner.Tap(0x05, context(game, 0)) == Planner::TapResult::REJECTED);  // One at a time.
+	}
+
+	// Cancellation while a direction is held: each releases it and records why.
+	{
+		const struct { Planner::CancelReason reason; int change; } cases[] = {
+			{ Planner::CancelReason::FOCUS, 0 }, { Planner::CancelReason::PAUSED, 1 }, { Planner::CancelReason::STATE_LOAD, 2 },
+			{ Planner::CancelReason::CLOCK, 3 }, { Planner::CancelReason::OTHER_INPUT, 4 }, { Planner::CancelReason::TIMEOUT, 5 },
+			{ Planner::CancelReason::STATE_CHANGED, 6 }, { Planner::CancelReason::BOARD_CHANGED, 7 }, { Planner::CancelReason::STATE_CHANGED, 8 },
+		};
+		for (const auto &test : cases) {
+			FakeTF3FieldGame game;
+			game.cards[0x05] = 0x04805C29;
+			Planner planner;
+			uint64_t vblanks = 100;
+			EXPECT_TRUE(planner.Tap(0x05, context(game, vblanks)) == Planner::TapResult::NAVIGATING);
+			Planner::Step step = planner.Update(context(game, ++vblanks));
+			EXPECT_TRUE(step.press == FieldButton::UP);
+			game.Apply(step);
+			Planner::Context c = context(game, ++vblanks);
+			switch (test.change) {
+			case 0: c.focused = false; break;
+			case 1: c.paused = true; break;
+			case 2: c.stateSerial = 1; break;
+			case 3: c.vblanks = 50; break;
+			case 4: c.otherInput = true; break;
+			case 5: c.wallTime += 4.0; break;
+			case 6: c.snapshot.state = FieldState::SETTLING; break;
+			case 7: c.snapshot.cards[0x08] = 0x1111; break;
+			case 8: c.snapshot.state = FieldState::DIALOG; break;
+			}
+			step = planner.Update(c);
+			EXPECT_TRUE(step.release == FieldButton::UP);
+			EXPECT_TRUE(step.press == FieldButton::NONE);
+			EXPECT_FALSE(planner.Active());
+			EXPECT_TRUE(planner.LastCancel() == test.reason);
+		}
+		// Explicit cancel, as on a new pointer press, a key, or a virtual button.
+		FakeTF3FieldGame game;
+		game.cards[0x05] = 0x04805C29;
+		Planner planner;
+		planner.Tap(0x05, context(game, 0));
+		game.Apply(planner.Update(context(game, 1)));
+		EXPECT_TRUE(planner.Cancel(Planner::CancelReason::OTHER_INPUT).release == FieldButton::UP);
+		EXPECT_TRUE(planner.Cancel().release == FieldButton::NONE);
+	}
+
+	// The game doing something unexpected: ignoring a press, moving the wrong way, or the cursor
+	// moving on its own.
+	{
+		FakeTF3FieldGame game;
+		game.cursorCode = 0x0E;
+		game.cards[0x0B] = 0x1234;
+		game.ignorePresses = true;
+		Planner planner;
+		uint64_t vblanks = 0;
+		EXPECT_TRUE(planner.Tap(0x0B, context(game, vblanks)) == Planner::TapResult::NAVIGATING);
+		EXPECT_TRUE(run(planner, game, &vblanks));
+		EXPECT_TRUE(planner.LastCancel() == Planner::CancelReason::CURSOR);
+		EXPECT_EQ_INT(game.presses, 1);
+
+		FakeTF3FieldGame wrong;
+		wrong.cursorCode = 0x0E;
+		wrong.cards[0x10] = 0x1234;
+		wrong.wrongWay = true;
+		vblanks = 0;
+		EXPECT_TRUE(planner.Tap(0x10, context(wrong, vblanks)) == Planner::TapResult::NAVIGATING);
+		EXPECT_TRUE(run(planner, wrong, &vblanks));
+		EXPECT_TRUE(planner.LastCancel() == Planner::CancelReason::CURSOR);
+		EXPECT_EQ_INT((int)wrong.cursorCode, 0x0C);
+		EXPECT_EQ_INT(wrong.presses, 1);
+
+		FakeTF3FieldGame drift;
+		drift.cursorCode = 0x0A;
+		drift.cards[0x12] = 0x1234;
+		vblanks = 0;
+		EXPECT_TRUE(planner.Tap(0x12, context(drift, vblanks)) == Planner::TapResult::NAVIGATING);
+		drift.cursorCode = 0x00;  // Moved by something else before the first press.
+		const Planner::Step step = planner.Update(context(drift, 1));
+		EXPECT_TRUE(step.press == FieldButton::NONE);
+		EXPECT_TRUE(planner.LastCancel() == Planner::CancelReason::CURSOR);
+	}
+	return true;
+}
+
+bool TestTagForce3LanguageSelection() {
+	using namespace TagForce3Language;
+	for (int i = 0; i < 5; ++i) {
+		float top = 128.0f + i * 26.0f;
+		EXPECT_EQ_INT(HitTest(240.0f, top + 11.0f, 0.0f, 0.0f, 480.0f, 272.0f), i);
+		EXPECT_EQ_INT(HitTest(140.0f, top, 0.0f, 0.0f, 480.0f, 272.0f), i);
+		EXPECT_EQ_INT(HitTest(339.9f, top + 21.9f, 0.0f, 0.0f, 480.0f, 272.0f), i);
+		EXPECT_EQ_INT(HitTest(240.0f, top + 23.0f, 0.0f, 0.0f, 480.0f, 272.0f), -1);
+		EXPECT_EQ_INT(HitTest(420.0f + 3.0f * 240.0f, 3.0f * (top + 11.0f), 420.0f, 0.0f, 1440.0f, 816.0f), i);
+		EXPECT_EQ_INT(HitTest(978.0f * 0.5f, 79.0f + 554.0f * (top + 11.0f) / 272.0f,
+			0.0f, 79.0f, 978.0f, 554.0f), i);
+	}
+	EXPECT_EQ_INT(HitTest(139.9f, 139.0f, 0.0f, 0.0f, 480.0f, 272.0f), -1);
+	EXPECT_EQ_INT(HitTest(340.0f, 139.0f, 0.0f, 0.0f, 480.0f, 272.0f), -1);
+	EXPECT_EQ_INT(HitTest(489.0f, 40.0f, 0.0f, 79.0f, 978.0f, 554.0f), -1);
+	EXPECT_EQ_INT(HitTest(240.0f, 139.0f, 0.0f, 0.0f, 0.0f, 272.0f), -1);
+	int byteReads = 0;
+	int wordReads = 0;
+	uint8_t selected = 0;
+	uint32_t screenMode = LANGUAGE_SETTINGS_PROGRESS;
+	const char *loadedModule = "modtitle";
+	uint32_t loadedBase = MODTITLE_BASE;
+	auto isLoaded = [&loadedModule, &loadedBase](const char *name, uint32_t *base) {
+		*base = loadedBase;
+		return !strcmp(name, loadedModule);
+	};
+	auto readByte = [&byteReads, &selected](uint32_t address, uint8_t *value) {
+		++byteReads;
+		switch (address) {
+		case 0x08EEACD2: *value = 7; return true;
+		case SELECTION_ADDRESS: *value = selected; return true;
+		case 0x08EEACDC: *value = 1; return true;
+		case 0x08EEACDE: *value = 1; return true;
+		default: return false;
+		}
+	};
+	auto readWord = [&wordReads, &screenMode](uint32_t address, uint32_t *value) {
+		++wordReads;
+		if (address != BOOT_PROGRESS_ADDRESS) {
+			return false;
+		}
+		*value = screenMode;
+		return true;
+	};
+	EXPECT_FALSE(Observe("ULES00600", "1.02", isLoaded, readByte, readWord).supportedGame);
+	EXPECT_FALSE(Observe("ULES01183", "1.01", isLoaded, readByte, readWord).supportedGame);
+	EXPECT_EQ_INT(byteReads + wordReads, 0);
+	// 7 also occurs in a duel intro, when these menu bytes are stale: modtitle must be loaded.
+	for (const char *module : { "modduel_mgr", "modehsys" }) {
+		loadedModule = module;
+		int previousReads = byteReads + wordReads;
+		Snapshot wrongModule = Observe("ULES01183", "1.02", isLoaded, readByte, readWord);
+		EXPECT_FALSE(wrongModule.validRead || wrongModule.matchesObservedPattern);
+		EXPECT_EQ_INT(byteReads + wordReads, previousReads);
+	}
+	loadedModule = "modtitle";
+	loadedBase = 0x09000000;
+	EXPECT_FALSE(Observe("ULES01183", "1.02", isLoaded, readByte, readWord).matchesObservedPattern);
+	loadedBase = MODTITLE_BASE;
+	Snapshot snapshot = Observe("ULES01183", "1.02", isLoaded, readByte, readWord);
+	EXPECT_TRUE(snapshot.supportedGame && snapshot.validRead && snapshot.matchesObservedPattern);
+	EXPECT_EQ_INT(snapshot.selection, 0);
+	for (selected = 1; selected <= 4; ++selected) {
+		Snapshot moved = Observe("ULES01183", "1.02", isLoaded, readByte, readWord);
+		EXPECT_TRUE(moved.validRead && moved.matchesObservedPattern);
+		EXPECT_EQ_INT(moved.selection, selected);
+	}
+	selected = 0;
+	for (uint32_t otherMode : { 14U, 15U, 16U }) {
+		screenMode = otherMode;
+		int previousByteReads = byteReads;
+		Snapshot staleMenu = Observe("ULES01183", "1.02", isLoaded, readByte, readWord);
+		EXPECT_FALSE(staleMenu.validRead || staleMenu.matchesObservedPattern);
+		EXPECT_EQ_INT(byteReads, previousByteReads);
+	}
+	screenMode = LANGUAGE_SETTINGS_PROGRESS;
+	EXPECT_TRUE(Observe("ULES01183", "1.02", isLoaded, readByte, readWord).matchesObservedPattern);
+	Snapshot invalid = Observe("ULES01183", "1.02", isLoaded, readByte, [](uint32_t, uint32_t *) { return false; });
+	EXPECT_FALSE(invalid.validRead || invalid.matchesObservedPattern);
+	invalid = Observe("ULES01183", "1.02", isLoaded, [](uint32_t, uint8_t *) { return false; }, readWord);
+	EXPECT_FALSE(invalid.validRead || invalid.matchesObservedPattern);
+	invalid = Observe("ULES01183", "1.02", isLoaded, [&readByte](uint32_t address, uint8_t *value) {
+		return address != 0x08EEACDC && readByte(address, value);
+	}, readWord);
+	EXPECT_FALSE(invalid.validRead || invalid.matchesObservedPattern);
+	Snapshot wrongMenu = Observe("ULES01183", "1.02", isLoaded, [&readByte](uint32_t address, uint8_t *value) {
+		if (address == 0x08EEACD2) {
+			*value = 1;
+			return true;
+		}
+		return readByte(address, value);
+	}, readWord);
+	EXPECT_TRUE(wrongMenu.validRead);
+	EXPECT_FALSE(wrongMenu.matchesObservedPattern);
+	selected = 5;
+	EXPECT_FALSE(Observe("ULES01183", "1.02", isLoaded, readByte, readWord).matchesObservedPattern);
+	selected = 0;
+
+	Context context{ snapshot, false, true, false, 1 };
+	Planner planner;
+	EXPECT_FALSE(planner.Start(4, context, 0.0));  // Observed bytes do not prove menu identity.
+	context.confirmedMenu = true;
+	EXPECT_FALSE(planner.Start(5, context, 0.0));
+	EXPECT_TRUE(planner.Start(4, context, 0.0));
+	for (int index = 0; index < 4; ++index) {
+		double at = index * 0.2;
+		Step press = planner.Update(context, at);
+		EXPECT_TRUE(press.press == Direction::DOWN && press.release == Direction::NONE);
+		EXPECT_TRUE(planner.Update(context, at + 0.04).release == Direction::NONE);
+		Step release = planner.Update(context, at + 0.09);
+		EXPECT_TRUE(release.release == Direction::DOWN && release.press == Direction::NONE);
+		context.snapshot.selection = index + 1;
+		EXPECT_TRUE(planner.Update(context, at + 0.10).press == Direction::NONE);
+	}
+	EXPECT_FALSE(planner.Active());
+	EXPECT_EQ_INT(planner.Steps(), 4);
+	EXPECT_TRUE(planner.Update(context, 1.0).press == Direction::NONE);
+
+	context.snapshot.selection = 3;
+	EXPECT_TRUE(planner.Start(0, context, 2.0));
+	EXPECT_TRUE(planner.Update(context, 2.0).press == Direction::UP);
+	context.snapshot.selection = 1;
+	EXPECT_TRUE(planner.Update(context, 2.01).release == Direction::UP);
+	EXPECT_FALSE(planner.Active());
+
+	context.snapshot.selection = 0;
+	EXPECT_TRUE(planner.Start(1, context, 3.0));
+	EXPECT_TRUE(planner.Update(context, 3.0).press == Direction::DOWN);
+	context.paused = true;
+	EXPECT_TRUE(planner.Update(context, 3.01).release == Direction::DOWN);
+	context.paused = false;
+	EXPECT_TRUE(planner.Start(1, context, 4.0));
+	EXPECT_TRUE(planner.Update(context, 4.0).press == Direction::DOWN);
+	context.stateLoadSerial++;
+	EXPECT_TRUE(planner.Update(context, 4.01).release == Direction::DOWN);
+	EXPECT_TRUE(planner.Start(1, context, 5.0));
+	EXPECT_TRUE(planner.Update(context, 5.0).press == Direction::DOWN);
+	context.focused = false;
+	EXPECT_TRUE(planner.Update(context, 5.01).release == Direction::DOWN);
+	context.focused = true;
+	EXPECT_TRUE(planner.Start(1, context, 6.0));
+	EXPECT_TRUE(planner.Update(context, 6.0).press == Direction::DOWN);
+	context.snapshot.supportedGame = false;
+	EXPECT_TRUE(planner.Update(context, 6.01).release == Direction::DOWN);
+	context.snapshot.supportedGame = true;
+	EXPECT_TRUE(planner.Start(1, context, 7.0));
+	EXPECT_TRUE(planner.Update(context, 7.0).press == Direction::DOWN);
+	EXPECT_TRUE(planner.Update(context, 9.1).release == Direction::DOWN);
+	return true;
+}
+
 // Records what the ControlMapper tells us, so a test can check it.
 class TestControlListener : public ControlListener {
 public:
@@ -3133,6 +4993,35 @@ static bool SendKey(ControlMapper *mapper, int keyCode, bool down) {
 	key.keyCode = (InputKeyCode)keyCode;
 	key.flags = down ? KeyInputFlags::DOWN : KeyInputFlags::UP;
 	return mapper->Key(key);
+}
+
+bool TestNavigationInputMix() {
+	using KeyMap::MultiInputMapping;
+	KeyMap::ClearAllMappings();
+	KeyMap::SetInputMapping(CTRL_CROSS, MultiInputMapping(InputMapping(DEVICE_ID_PAD_0, NKCODE_BUTTON_1)), true);
+	KeyMap::SetInputMapping(CTRL_UP, MultiInputMapping(InputMapping(DEVICE_ID_PAD_0, NKCODE_BUTTON_2)), true);
+	TestControlListener listener;
+	ControlMapper mapper;
+	mapper.AddListener(&listener);
+
+	SendKey(&mapper, NKCODE_BUTTON_1, true);
+	mapper.SetNavigationButtons(CTRL_CROSS, 0);
+	mapper.SetNavigationButtons(0, CTRL_CROSS);
+	EXPECT_EQ_INT((int)(listener.buttons & CTRL_CROSS), (int)CTRL_CROSS);
+	mapper.SetNavigationButtons(CTRL_CROSS, 0);
+	SendKey(&mapper, NKCODE_BUTTON_1, false);
+	EXPECT_EQ_INT((int)(listener.buttons & CTRL_CROSS), (int)CTRL_CROSS);
+	mapper.SetNavigationButtons(0, CTRL_CROSS);
+	EXPECT_EQ_INT((int)(listener.buttons & CTRL_CROSS), 0);
+
+	SendKey(&mapper, NKCODE_BUTTON_2, true);
+	mapper.SetNavigationButtons(CTRL_CROSS, 0);
+	EXPECT_EQ_INT((int)(listener.buttons & (CTRL_CROSS | CTRL_UP)), (int)(CTRL_CROSS | CTRL_UP));
+	mapper.ReleaseAll();
+	EXPECT_EQ_INT((int)(listener.buttons & (CTRL_CROSS | CTRL_UP)), 0);
+	mapper.RemoveListener(&listener);
+	KeyMap::ClearAllMappings();
+	return true;
 }
 
 // A mapping shouldn't fire when a longer mapping sharing an input with it is held. See #20621.
@@ -4240,6 +6129,13 @@ TestItem availableTests[] = {
 	TEST_ITEM(FastVec),
 	TEST_ITEM(SmallDataConvert),
 	TEST_ITEM(InputMapping),
+	TEST_ITEM(TouchNavigation),
+	TEST_ITEM(TagForce3LanguageSelection),
+	TEST_ITEM(TagForce3Duel),
+	TEST_ITEM(TagForce3DuelInput),
+	TEST_ITEM(TagForce3DuelField),
+	TEST_ITEM(TagForce3DuelFieldInput),
+	TEST_ITEM(NavigationInputMix),
 	TEST_ITEM(ComboSuppression),
 	TEST_ITEM(EscapeMenuString),
 	TEST_ITEM(VFS),

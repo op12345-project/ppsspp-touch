@@ -37,6 +37,7 @@
 const float TOUCH_SCALE_FACTOR = 1.5f;
 
 static uint32_t usedPointerMask = 0;
+static std::set<int> usedGesturePointers;
 static uint32_t analogPointerMask = 0;
 
 static float g_gamepadOpacity;
@@ -80,6 +81,14 @@ void GamepadResetTouch() {
 
 void GamepadTouch() {
 	g_lastTouch = time_now_d();
+}
+
+bool GamepadTouchUsed(int pointerId) {
+	return (pointerId >= 0 && pointerId < TOUCH_MAX_POINTERS && (usedPointerMask & (1 << pointerId))) || usedGesturePointers.count(pointerId) != 0;
+}
+
+bool GamepadAnyTouchUsed() {
+	return usedPointerMask != 0 || !usedGesturePointers.empty();
 }
 
 float GamepadGetOpacity() {
@@ -1172,6 +1181,7 @@ const GestureControlConfig &GestureGamepad::GetZone() {
 GestureGamepad::~GestureGamepad() {
 	if (dragPointerId_ != -1) {
 		g_activeGesturePointers.erase(dragPointerId_);
+		usedGesturePointers.erase(dragPointerId_);
 	}
 }
 
@@ -1194,15 +1204,18 @@ bool GestureGamepad::Touch(const TouchInput &input) {
 
 	const GestureControlConfig &zone = GetZone();
 
-	if (usedPointerMask & (1 << input.id)) {
-		if (input.id == dragPointerId_)
-			dragPointerId_ = -1;
-		return false;
-	}
-
 	if (input.flags & TouchInputFlags::RELEASE_ALL) {
 		dragPointerId_ = -1;
 		g_activeGesturePointers.clear();
+		usedGesturePointers.clear();
+		return false;
+	}
+
+	if (usedPointerMask & (1 << input.id)) {
+		if (input.id == dragPointerId_) {
+			dragPointerId_ = -1;
+			usedGesturePointers.erase(input.id);
+		}
 		return false;
 	}
 
@@ -1213,6 +1226,7 @@ bool GestureGamepad::Touch(const TouchInput &input) {
 
 		if (dragPointerId_ == -1 && input.x >= minX && input.x < maxX) {
 			dragPointerId_ = input.id;
+			usedGesturePointers.insert(input.id);
 			lastX_ = input.x;
 			lastY_ = input.y;
 			downX_ = input.x;
@@ -1258,6 +1272,7 @@ bool GestureGamepad::Touch(const TouchInput &input) {
 		g_activeGesturePointers.erase(input.id);
 		if (input.id == dragPointerId_) {
 			dragPointerId_ = -1;
+			usedGesturePointers.erase(input.id);
 			if (time_now_d() - lastTouchDown_ < 0.3f)
 				lastTapRelease_ = time_now_d();
 

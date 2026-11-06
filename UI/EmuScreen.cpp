@@ -56,8 +56,10 @@ using namespace std::placeholders;
 #include "Core/CoreTiming.h"
 #include "Core/CoreParameter.h"
 #include "Core/Core.h"
+#include "Core/Debugger/SymbolMap.h"
 #include "Core/KeyMap.h"
 #include "Core/MemFault.h"
+#include "Core/MemMap.h"
 #include "Core/Reporting.h"
 #include "Core/Util/PathUtil.h"
 #include "Core/System.h"
@@ -456,6 +458,9 @@ void EmuScreen::bootComplete() {
 }
 
 EmuScreen::~EmuScreen() {
+	ResetTouchNavigation();
+	CancelTF3DuelInput(TagForce3Duel::HandActionPlanner::CancelReason::REQUESTED);
+	CancelTF3FieldInput(TagForce3Duel::FieldActionPlanner::CancelReason::REQUESTED);
 	g_controlMapper.RemoveListener(this);
 
 	std::string gameID = g_paramSFO.GetValueString("DISC_ID");
@@ -531,6 +536,12 @@ void EmuScreen::dialogFinished(const Screen *dialog, DialogResult result) {
 
 void EmuScreen::focusChanged(ScreenFocusChange focusChange) {
 	Screen::focusChanged(focusChange);
+	if (focusChange == ScreenFocusChange::FOCUS_LOST_TOP) {
+		ResetTouchNavigation();
+		CancelTF3LanguageSelection();
+		CancelTF3DuelInput(TagForce3Duel::HandActionPlanner::CancelReason::FOCUS);
+		CancelTF3FieldInput(TagForce3Duel::FieldActionPlanner::CancelReason::FOCUS);
+	}
 
 	std::string gameID = g_paramSFO.GetValueString("DISC_ID");
 	if (gameID.empty()) {
@@ -1177,8 +1188,342 @@ InputMode EmuScreen::PassInputToMapper() const {
 	return InputMode::Keyboard | InputMode::Mouse | InputMode::Other | InputMode::ImDebuggerToggle;
 }
 
+void EmuScreen::ResetTouchNavigation() {
+	g_controlMapper.SetNavigationButtons(0, touchNavigation_.Reset());
+}
+
+void EmuScreen::CancelTF3LanguageSelection() {
+	TagForce3Language::Step step = tf3LanguagePlanner_.Cancel();
+	uint32_t release = step.release == TagForce3Language::Direction::UP ? CTRL_UP :
+		step.release == TagForce3Language::Direction::DOWN ? CTRL_DOWN : 0;
+	g_controlMapper.SetNavigationButtons(0, release);
+	tf3LanguagePointer_.CancelPointer();
+	tf3LanguageDownTarget_ = -1;
+}
+
+// The game's output rectangle in pointer coordinates. Rotated layouts aren't measured.
+bool EmuScreen::TF3GameViewport(FRect *viewport) const {
+	const DisplayLayoutConfig &config = GameLayoutConfig();
+	if (config.iInternalScreenRotation != ROTATION_LOCKED_HORIZONTAL) {
+		return false;
+	}
+	FRect frame = GetScreenFrame(config.bIgnoreScreenInsets, g_display.pixel_xres, g_display.pixel_yres);
+	FRect rc;
+	CalculateDisplayOutputRect(config, &rc, 480.0f, 272.0f, frame, config.iInternalScreenRotation);
+	viewport->x = rc.x * g_display.dpi_scale_x;
+	viewport->y = rc.y * g_display.dpi_scale_y;
+	viewport->w = rc.w * g_display.dpi_scale_x;
+	viewport->h = rc.h * g_display.dpi_scale_y;
+	return true;
+}
+
+int EmuScreen::TF3LanguageHit(float x, float y) const {
+	FRect viewport;
+	if (!TF3GameViewport(&viewport)) {
+		return -1;
+	}
+	return TagForce3Language::HitTest(x, y, viewport.x, viewport.y, viewport.w, viewport.h);
+}
+
+static bool TF3ReadByte(uint32_t address, uint8_t *value) {
+	if (!Memory::IsActive() || !Memory::IsValidRange(address, 1)) {
+		return false;
+	}
+	*value = Memory::ReadUnchecked_U8(address);
+	return true;
+}
+
+static bool TF3ReadWord(uint32_t address, uint32_t *value) {
+	if (!Memory::IsActive() || !Memory::IsValidRange(address, 4)) {
+		return false;
+	}
+	*value = Memory::ReadUnchecked_U32(address);
+	return true;
+}
+
+static bool TF3ModuleLoaded(const char *name, uint32_t *base) {
+	if (!g_symbolMap) {
+		return false;
+	}
+	int index = g_symbolMap->GetModuleIndexByName(name);
+	if (index <= 0 || !g_symbolMap->IsModuleActive(index)) {
+		return false;
+	}
+	*base = g_symbolMap->GetModuleAbsoluteAddr(0, index);
+	return true;
+}
+
+// Reads guest memory and, with the probe enabled, logs. Input is only ever sent by the planner.
+void EmuScreen::UpdateTF3DuelState(bool active) {
+	if (!active) {
+		tf3DuelSnapshot_ = {};
+		tf3DuelGate_.Reset();
+		tf3DuelLogged_ = false;
+		tf3FieldSnapshot_ = {};
+		tf3FieldGate_.Reset();
+		tf3FieldLogged_ = false;
+		return;
+	}
+	const TagForce3Duel::Snapshot snapshot = tf3DuelGate_.Apply(TagForce3Duel::Observe(
+		g_paramSFO.GetValueString("DISC_ID"), g_paramSFO.GetValueString("DISC_VERSION"),
+		TF3ModuleLoaded, TF3ReadWord), __DisplayGetNumVblanks());
+	if (g_Config.bTF3DuelProbe && (!tf3DuelLogged_ || snapshot.state != tf3DuelSnapshot_.state ||
+		snapshot.cursorCode != tf3DuelSnapshot_.cursorCode || snapshot.handCount != tf3DuelSnapshot_.handCount)) {
+		INFO_LOG(Log::System, "TF3 duel probe: %s (code %08x, slot %d, hand %u, overlay %u, ready %u, prompt %02x, x %.1f)",
+			TagForce3Duel::StateName(snapshot.state), snapshot.cursorCode, snapshot.selectedIndex, snapshot.handCount,
+			snapshot.overlay, snapshot.ready, snapshot.promptFlags, snapshot.cursorX);
+		tf3DuelLogged_ = true;
+	}
+	tf3DuelSnapshot_ = snapshot;
+
+	if (!g_Config.bTF3DuelProbe && !g_Config.bTF3DuelFieldInput) {
+		tf3FieldSnapshot_ = {};
+		tf3FieldGate_.Reset();
+		tf3FieldLogged_ = false;
+		return;
+	}
+	const TagForce3Duel::FieldSnapshot field = tf3FieldGate_.Apply(TagForce3Duel::ObserveField(
+		g_paramSFO.GetValueString("DISC_ID"), g_paramSFO.GetValueString("DISC_VERSION"),
+		TF3ModuleLoaded, TF3ReadWord), __DisplayGetNumVblanks());
+	if (g_Config.bTF3DuelProbe && (!tf3FieldLogged_ || field.state != tf3FieldSnapshot_.state ||
+		field.cursorCode != tf3FieldSnapshot_.cursorCode || field.OccupiedMask() != tf3FieldSnapshot_.OccupiedMask())) {
+		INFO_LOG(Log::System, "TF3 field probe: %s (code %08x, row %u col %u, overlay %u, ready %u, prompt %02x, select %u/%u/%u anim %u, occupied %05x)",
+			TagForce3Duel::FieldStateName(field.state), field.cursorCode, field.row, field.column, field.overlay, field.ready,
+			field.promptFlags, field.selectAttack, field.selectCard, field.selectDialog, field.selectAnim, field.OccupiedMask());
+		tf3FieldLogged_ = true;
+	}
+	tf3FieldSnapshot_ = field;
+}
+
+TagForce3Duel::HandActionPlanner::Context EmuScreen::TF3DuelContext() const {
+	TagForce3Duel::HandActionPlanner::Context context;
+	context.snapshot = tf3DuelSnapshot_;
+	context.focused = IsOnTop() && (!chatMenu_ || chatMenu_->GetVisibility() != UI::V_VISIBLE);
+	context.paused = !PSP_IsInited() || bootPending_ || coreState != CORE_RUNNING_CPU || SaveState::IsBusy();
+	context.otherInput = (g_controlMapper.MappedButtons() & CTRL_MASK_USER) != 0;
+	context.stateSerial = tf3StateSerial_;
+	context.vblanks = (uint64_t)__DisplayGetNumVblanks();
+	context.wallTime = time_now_d();
+	return context;
+}
+
+void EmuScreen::ApplyTF3DuelStep(TagForce3Duel::HandActionPlanner::Step step) {
+	using Button = TagForce3Duel::HandActionPlanner::Button;
+	auto toMask = [](Button button) -> uint32_t {
+		switch (button) {
+		case Button::LEFT: return CTRL_LEFT;
+		case Button::RIGHT: return CTRL_RIGHT;
+		case Button::DOWN: return CTRL_DOWN;
+		case Button::CROSS: return CTRL_CROSS;
+		default: return 0;
+		}
+	};
+	const uint32_t press = toMask(step.press);
+	const uint32_t release = toMask(step.release);
+	if (press || release) {
+		g_controlMapper.SetNavigationButtons(press, release);
+	}
+}
+
+TagForce3Duel::FieldActionPlanner::Context EmuScreen::TF3FieldContext() const {
+	const TagForce3Duel::HandActionPlanner::Context hand = TF3DuelContext();
+	TagForce3Duel::FieldActionPlanner::Context context;
+	context.snapshot = tf3FieldSnapshot_;
+	context.focused = hand.focused;
+	context.paused = hand.paused;
+	context.otherInput = hand.otherInput;
+	context.stateSerial = hand.stateSerial;
+	context.vblanks = hand.vblanks;
+	context.wallTime = hand.wallTime;
+	return context;
+}
+
+void EmuScreen::ApplyTF3FieldStep(TagForce3Duel::FieldActionPlanner::Step step) {
+	using Button = TagForce3Duel::FieldButton;
+	auto toMask = [](Button button) -> uint32_t {
+		switch (button) {
+		case Button::LEFT: return CTRL_LEFT;
+		case Button::RIGHT: return CTRL_RIGHT;
+		case Button::UP: return CTRL_UP;
+		case Button::DOWN: return CTRL_DOWN;
+		default: return 0;
+		}
+	};
+	const uint32_t press = toMask(step.press);
+	const uint32_t release = toMask(step.release);
+	if (press || release) {
+		g_controlMapper.SetNavigationButtons(press, release);
+	}
+}
+
+void EmuScreen::CancelTF3FieldInput(TagForce3Duel::FieldActionPlanner::CancelReason reason) {
+	if (!tf3FieldPlanner_.Active()) {
+		return;
+	}
+	ApplyTF3FieldStep(tf3FieldPlanner_.Cancel(reason));
+	INFO_LOG(Log::System, "TF3 field input: cancelled (reason %d)", (int)reason);
+}
+
+void EmuScreen::CancelTF3DuelInput(TagForce3Duel::HandActionPlanner::CancelReason reason) {
+	const bool wasDriving = tf3DuelPlanner_.Driving();
+	ApplyTF3DuelStep(tf3DuelPlanner_.Cancel(reason));
+	tf3DuelPointer_.CancelPointer();
+	tf3DuelDownTarget_ = -1;
+	if (wasDriving) {
+		INFO_LOG(Log::System, "TF3 duel input: cancelled (reason %d)", (int)reason);
+	}
+}
+
+// Sets *consumed when this event belongs to a hand card or, in normal play, a field zone. Returns
+// true to stop further handling. The hand wins where both could claim a point.
+bool EmuScreen::TF3DuelTouch(const TouchInput &touch, bool mouseMapped, bool *consumed) {
+	using namespace TagForce3Duel;
+	using Reason = HandActionPlanner::CancelReason;
+	using FieldReason = FieldActionPlanner::CancelReason;
+	const bool running = IsOnTop() && !bootPending_ && PSP_IsInited() && coreState == CORE_RUNNING_CPU &&
+		!SaveState::IsBusy() && (!chatMenu_ || chatMenu_->GetVisibility() != UI::V_VISIBLE);
+	const bool enabled = g_Config.bTF3DuelHandInput && running;
+	const bool fieldEnabled = g_Config.bTF3DuelFieldInput && running;
+	auto hit = [this](float x, float y) {
+		FRect viewport;
+		return TF3GameViewport(&viewport) ? TagForce3Duel::HitTest(tf3DuelSnapshot_, x, y, viewport.x, viewport.y, viewport.w, viewport.h) : -1;
+	};
+	// A field zone owned by this tap: normal play only, never where the hand claims the point.
+	auto fieldHit = [&](float x, float y) {
+		FRect viewport;
+		if (tf3FieldSnapshot_.state != FieldState::NORMAL || !TF3GameViewport(&viewport)) {
+			return FieldHit{};
+		}
+		FieldHit field = HitTestField(tf3FieldSnapshot_, hit(x, y), x, y, viewport.x, viewport.y, viewport.w, viewport.h);
+		return field.accepted ? field : FieldHit{};
+	};
+	if (touch.flags & (TouchInputFlags::CANCEL | TouchInputFlags::RELEASE_ALL)) {
+		CancelTF3DuelInput(Reason::REQUESTED);
+		CancelTF3FieldInput(FieldReason::REQUESTED);
+		tf3FieldDownTarget_ = -1;
+	} else if (touch.flags & TouchInputFlags::DOWN) {
+		const bool free = !mouseMapped && !touchHandled_ && !GamepadAnyTouchUsed();
+		const int handTarget = enabled && free ? hit(touch.x, touch.y) : -1;
+		const int fieldTarget = fieldEnabled && free && handTarget < 0 ? fieldHit(touch.x, touch.y).zone : -1;
+		// Any new press takes over from a field move in progress.
+		CancelTF3FieldInput(FieldReason::OTHER_INPUT);
+		if (handTarget < 0 && tf3DuelPlanner_.Driving() && !tf3DuelPlanner_.Committed()) {
+			// Anything else, like a virtual button, takes over from a move in progress.
+			CancelTF3DuelInput(Reason::OTHER_INPUT);
+		}
+		tf3DuelDownTarget_ = handTarget;
+		tf3FieldDownTarget_ = fieldTarget;
+		if (handTarget >= 0 || fieldTarget >= 0) {
+			tf3DuelPointer_.PointerDown(touch.id, touch.x, touch.y, time_now_d(), (touch.flags & TouchInputFlags::MOUSE) != 0);
+			*consumed = true;
+		}
+	} else if (touch.flags & TouchInputFlags::MOVE) {
+		if (touchHandled_ || GamepadTouchUsed(touch.id)) {
+			if (tf3DuelPointer_.HasPointer()) {
+				tf3DuelPointer_.CancelPointer();
+				tf3DuelDownTarget_ = -1;
+				tf3FieldDownTarget_ = -1;
+			}
+		} else {
+			tf3DuelPointer_.PointerMove(touch.id, touch.x, touch.y);
+		}
+	} else if (touch.flags & TouchInputFlags::UP) {
+		const int target = tf3DuelDownTarget_;
+		const int fieldTarget = tf3FieldDownTarget_;
+		const bool tap = tf3DuelPointer_.PointerUp(touch.id, touch.x, touch.y, time_now_d()) == TouchNavigationGesture::TAP;
+		tf3DuelDownTarget_ = -1;
+		tf3FieldDownTarget_ = -1;
+		const bool free = !mouseMapped && !touchHandled_ && !GamepadTouchUsed(touch.id);
+		if (target >= 0) {
+			*consumed = true;
+			if (tap && enabled && free && target == hit(touch.x, touch.y)) {
+				ResetTouchNavigation();
+				HandActionPlanner::TapResult result = tf3DuelPlanner_.Tap(target, TF3DuelContext());
+				INFO_LOG(Log::System, "TF3 duel input: tap slot %d -> %d (%s)", target, (int)result, StateName(tf3DuelSnapshot_.state));
+			}
+		} else if (fieldTarget >= 0) {
+			// Empty zones are owned too, so a tap there does nothing at all.
+			*consumed = true;
+			const FieldHit field = fieldHit(touch.x, touch.y);
+			if (tap && fieldEnabled && free && field.zone == fieldTarget && field.occupied) {
+				ResetTouchNavigation();
+				// While the hand's X is still being answered, leave the cursor alone.
+				const FieldActionPlanner::TapResult result = tf3DuelPlanner_.Active() ? FieldActionPlanner::TapResult::REJECTED :
+					tf3FieldPlanner_.Tap(fieldTarget, TF3FieldContext());
+				INFO_LOG(Log::System, "TF3 field input: tap zone %02x -> %d (cursor %08x)", fieldTarget, (int)result, tf3FieldSnapshot_.cursorCode);
+			}
+		}
+	}
+	return *consumed;
+}
+
+void EmuScreen::LogTF3DuelPointer(float x, float y) const {
+	FRect viewport;
+	if (!TF3GameViewport(&viewport)) {
+		INFO_LOG(Log::System, "TF3 duel probe: pointer ignored in a rotated layout");
+		return;
+	}
+	float gameX = 0.0f;
+	float gameY = 0.0f;
+	const bool inside = PointerToGameFrame(x, y, viewport.x, viewport.y, viewport.w, viewport.h, &gameX, &gameY);
+	const int slot = TagForce3Duel::HitTest(tf3DuelSnapshot_, x, y, viewport.x, viewport.y, viewport.w, viewport.h);
+	INFO_LOG(Log::System, "TF3 duel probe: pointer %.0f,%.0f viewport %.0f,%.0f %.0fx%.0f psp %.1f,%.1f %s slot %d (%s) ui %d pad %d",
+		x, y, viewport.x, viewport.y, viewport.w, viewport.h, gameX, gameY, inside ? "inside" : "outside", slot,
+		TagForce3Duel::StateName(tf3DuelSnapshot_.state), touchHandled_ ? 1 : 0, GamepadAnyTouchUsed() ? 1 : 0);
+	const TagForce3Duel::FieldHit field = TagForce3Duel::HitTestField(tf3FieldSnapshot_, slot, x, y, viewport.x, viewport.y, viewport.w, viewport.h);
+	INFO_LOG(Log::System, "TF3 field probe: pointer psp %.1f,%.1f zone %d (%s) occupied %d card %08x accepted %d (%s)",
+		gameX, gameY, field.zone, field.zone < 0 ? "none" : TagForce3Duel::IsOpponentZone(field.zone) ? "opponent" : "player",
+		field.occupied ? 1 : 0, field.card, field.accepted ? 1 : 0, TagForce3Duel::FieldStateName(tf3FieldSnapshot_.state));
+}
+
+void EmuScreen::QueueTouchNavigation(TouchNavigationGesture gesture) {
+	uint32_t button = 0;
+	switch (gesture) {
+	case TouchNavigationGesture::TAP:
+		switch (g_Config.iTouchNavigationConfirmButton) {
+		case 1: button = CTRL_CIRCLE; break;
+		case 2: button = CTRL_SQUARE; break;
+		case 3: button = CTRL_TRIANGLE; break;
+		default: button = CTRL_CROSS; break;
+		}
+		break;
+	case TouchNavigationGesture::LEFT: button = CTRL_LEFT; break;
+	case TouchNavigationGesture::RIGHT: button = CTRL_RIGHT; break;
+	case TouchNavigationGesture::UP: button = CTRL_UP; break;
+	case TouchNavigationGesture::DOWN: button = CTRL_DOWN; break;
+	default: break;
+	}
+	touchNavigation_.Queue(button);
+}
+
 bool EmuScreen::key(const KeyInput &key) {
+	if ((key.flags & KeyInputFlags::DOWN) &&
+		(key.deviceId != DEVICE_ID_MOUSE || key.keyCode == NKCODE_EXT_MOUSEWHEEL_UP || key.keyCode == NKCODE_EXT_MOUSEWHEEL_DOWN)) {
+		if (tf3LanguagePlanner_.Active()) {
+			CancelTF3LanguageSelection();
+		}
+		if (tf3DuelPlanner_.Driving()) {
+			CancelTF3DuelInput(TagForce3Duel::HandActionPlanner::CancelReason::OTHER_INPUT);
+		}
+		if (tf3FieldPlanner_.Active()) {
+			CancelTF3FieldInput(TagForce3Duel::FieldActionPlanner::CancelReason::OTHER_INPUT);
+		}
+	}
 	bool retval = UIScreen::key(key);
+	if (g_Config.bTouchNavigation && !g_Config.bMouseControl && !retval && IsOnTop() && !bootPending_ && PSP_IsInited() &&
+		(!chatMenu_ || chatMenu_->GetVisibility() != UI::V_VISIBLE) &&
+		key.deviceId == DEVICE_ID_MOUSE && (key.flags & KeyInputFlags::DOWN) &&
+		!KeyMap::InputMappingToPspButton(InputMapping(key.deviceId, key.keyCode), nullptr) &&
+		!GamepadAnyTouchUsed()) {
+		if (key.keyCode == NKCODE_EXT_MOUSEWHEEL_UP) {
+			QueueTouchNavigation(TouchNavigationGesture::UP);
+			return true;
+		}
+		if (key.keyCode == NKCODE_EXT_MOUSEWHEEL_DOWN) {
+			QueueTouchNavigation(TouchNavigationGesture::DOWN);
+			return true;
+		}
+	}
 
 	if (!retval && (key.flags & KeyInputFlags::DOWN) != 0 && UI::IsEscapeKey(key)) {
 		if (chatMenu_)
@@ -1194,6 +1539,12 @@ bool EmuScreen::key(const KeyInput &key) {
 
 bool EmuScreen::touch(const TouchInput &touch) {
 	System_Notify(SystemNotification::ACTIVITY);
+	if (touch.flags & TouchInputFlags::RELEASE_ALL) {
+		ResetTouchNavigation();
+		CancelTF3LanguageSelection();
+		CancelTF3DuelInput(TagForce3Duel::HandActionPlanner::CancelReason::REQUESTED);
+		CancelTF3FieldInput(TagForce3Duel::FieldActionPlanner::CancelReason::REQUESTED);
+	}
 
 	bool ignoreGamepad = false;
 
@@ -1227,7 +1578,94 @@ bool EmuScreen::touch(const TouchInput &touch) {
 				}
 			}
 		}
-		return UIScreen::touch(touch);
+		const bool navigationEnabled = g_Config.bTouchNavigation && IsOnTop() && !bootPending_ &&
+			(!chatMenu_ || chatMenu_->GetVisibility() != UI::V_VISIBLE);
+		const bool tf3Enabled = g_Config.bTF3LanguageProbe && IsOnTop() && !bootPending_ &&
+			PSP_IsInited() && coreState == CORE_RUNNING_CPU &&
+			tf3LanguageSnapshot_.matchesObservedPattern && !SaveState::IsBusy() &&
+			(!chatMenu_ || chatMenu_->GetVisibility() != UI::V_VISIBLE);
+		const bool mouse = (touch.flags & TouchInputFlags::MOUSE) != 0;
+		const bool androidMouseDuplicate = !mouse && (((int)touch.flags & (7 << 10)) == (3 << 10));
+		if (navigationEnabled && !androidMouseDuplicate && (touch.flags & TouchInputFlags::DOWN)) {
+			// A new touch may press a virtual control, so release any earlier pulse first.
+			ResetTouchNavigation();
+		}
+		bool result = UIScreen::touch(touch);
+		if (androidMouseDuplicate) {
+			return result;
+		}
+		if (g_Config.bTF3DuelProbe && (touch.flags & TouchInputFlags::DOWN)) {
+			LogTF3DuelPointer(touch.x, touch.y);
+		}
+		const bool mouseLeftEvent = (touch.buttons & 1) ||
+			(touchNavigation_.HasPointer() && touchNavigation_.PointerIsMouse()) ||
+			(tf3LanguagePointer_.HasPointer() && tf3LanguagePointer_.PointerIsMouse()) ||
+			(tf3DuelPointer_.HasPointer() && tf3DuelPointer_.PointerIsMouse());
+		const bool mouseMapped = mouse && (g_Config.bMouseControl || !mouseLeftEvent ||
+			KeyMap::InputMappingToPspButton(InputMapping(DEVICE_ID_MOUSE, NKCODE_EXT_MOUSEBUTTON_1), nullptr));
+		bool tf3DuelConsumed = false;
+		if (TF3DuelTouch(touch, mouseMapped, &tf3DuelConsumed)) {
+			return true;
+		}
+		if (touch.flags & (TouchInputFlags::CANCEL | TouchInputFlags::RELEASE_ALL)) {
+			CancelTF3LanguageSelection();
+		} else if (touch.flags & TouchInputFlags::DOWN) {
+			if (tf3LanguagePlanner_.Active()) {
+				CancelTF3LanguageSelection();
+			}
+			tf3LanguageDownTarget_ = tf3Enabled && !mouseMapped && !touchHandled_ && !GamepadAnyTouchUsed() ? TF3LanguageHit(touch.x, touch.y) : -1;
+			if (tf3LanguageDownTarget_ >= 0) {
+				tf3LanguagePointer_.PointerDown(touch.id, touch.x, touch.y, time_now_d(), mouse);
+			}
+		} else if (touch.flags & TouchInputFlags::MOVE) {
+			if (touchHandled_ || GamepadTouchUsed(touch.id)) {
+				CancelTF3LanguageSelection();
+			} else {
+				tf3LanguagePointer_.PointerMove(touch.id, touch.x, touch.y);
+			}
+		} else if (touch.flags & TouchInputFlags::UP) {
+			int target = tf3LanguageDownTarget_;
+			bool tap = tf3LanguagePointer_.PointerUp(touch.id, touch.x, touch.y, time_now_d()) == TouchNavigationGesture::TAP;
+			tf3LanguageDownTarget_ = -1;
+			if (tap && tf3Enabled && !mouseMapped && !touchHandled_ && !GamepadTouchUsed(touch.id) &&
+				target == TF3LanguageHit(touch.x, touch.y)) {
+				ResetTouchNavigation();
+				TagForce3Language::Context context{ tf3LanguageSnapshot_, true, IsOnTop(), false, tf3StateSerial_ };
+				tf3LanguagePlanner_.Start(target, context, time_now_d());
+				return true;
+			}
+			if (target >= 0) {
+				return result;
+			}
+		}
+		if (!navigationEnabled || (mouse && (g_Config.bMouseControl || !mouseLeftEvent ||
+			KeyMap::InputMappingToPspButton(InputMapping(DEVICE_ID_MOUSE, NKCODE_EXT_MOUSEBUTTON_1), nullptr)))) {
+			touchNavigation_.CancelPointer();
+			return result;
+		}
+		if (touch.flags & (TouchInputFlags::CANCEL | TouchInputFlags::RELEASE_ALL)) {
+			touchNavigation_.CancelPointer();
+		} else if (touch.flags & TouchInputFlags::DOWN) {
+			if (!touchHandled_ && !GamepadAnyTouchUsed()) {
+				if (tf3LanguageDownTarget_ >= 0) {
+					return true;
+				}
+				touchNavigation_.PointerDown(touch.id, touch.x, touch.y, time_now_d(), mouse);
+			}
+		} else if (touch.flags & TouchInputFlags::MOVE) {
+			if (touchHandled_ || GamepadTouchUsed(touch.id)) {
+				touchNavigation_.CancelPointer();
+			} else {
+				touchNavigation_.PointerMove(touch.id, touch.x, touch.y);
+			}
+		} else if (touch.flags & TouchInputFlags::UP) {
+			if (touchHandled_) {
+				touchNavigation_.CancelPointer();
+			} else {
+				QueueTouchNavigation(touchNavigation_.PointerUp(touch.id, touch.x, touch.y, time_now_d()));
+			}
+		}
+		return result;
 	}
 	return false;
 }
@@ -1451,6 +1889,67 @@ void EmuScreen::update() {
 
 	// This is where views are recreated.
 	UIScreen::update();
+	bool stateBusy = SaveState::IsBusy();
+	if (stateBusy && !tf3StateBusy_) {
+		++tf3StateSerial_;
+	}
+	tf3StateBusy_ = stateBusy;
+	if (g_Config.bTF3LanguageProbe && gameRunning && IsOnTop() && !stateBusy) {
+		// update() runs in NativeFrame on the CPU thread. Validate every address before reading.
+		tf3LanguageSnapshot_ = TagForce3Language::Observe(
+			g_paramSFO.GetValueString("DISC_ID"), g_paramSFO.GetValueString("DISC_VERSION"),
+			TF3ModuleLoaded, TF3ReadByte, TF3ReadWord);
+		if (tf3LanguageSnapshot_.matchesObservedPattern && !tf3LanguagePatternSeen_) {
+			INFO_LOG(Log::System, "TF3 language menu memory pattern observed (selection %u)", tf3LanguageSnapshot_.selection);
+		}
+		tf3LanguagePatternSeen_ = tf3LanguageSnapshot_.matchesObservedPattern;
+	} else {
+		tf3LanguageSnapshot_ = {};
+		tf3LanguagePatternSeen_ = false;
+	}
+	UpdateTF3DuelState((g_Config.bTF3DuelProbe || g_Config.bTF3DuelHandInput || g_Config.bTF3DuelFieldInput) && gameRunning && IsOnTop() && !stateBusy);
+	if (tf3DuelPlanner_.Active()) {
+		if (!g_Config.bTF3DuelHandInput || GameLayoutConfig().iInternalScreenRotation != ROTATION_LOCKED_HORIZONTAL) {
+			CancelTF3DuelInput(TagForce3Duel::HandActionPlanner::CancelReason::REQUESTED);
+		} else {
+			const bool wasDriving = tf3DuelPlanner_.Driving();
+			ApplyTF3DuelStep(tf3DuelPlanner_.Update(TF3DuelContext()));
+			if (wasDriving && !tf3DuelPlanner_.Active() && tf3DuelPlanner_.LastCancel() != TagForce3Duel::HandActionPlanner::CancelReason::NONE) {
+				INFO_LOG(Log::System, "TF3 duel input: cancelled (reason %d)", (int)tf3DuelPlanner_.LastCancel());
+			}
+		}
+	}
+	if (tf3FieldPlanner_.Active()) {
+		if (!g_Config.bTF3DuelFieldInput || GameLayoutConfig().iInternalScreenRotation != ROTATION_LOCKED_HORIZONTAL) {
+			CancelTF3FieldInput(TagForce3Duel::FieldActionPlanner::CancelReason::REQUESTED);
+		} else {
+			ApplyTF3FieldStep(tf3FieldPlanner_.Update(TF3FieldContext()));
+			if (!tf3FieldPlanner_.Active()) {
+				INFO_LOG(Log::System, "TF3 field input: %s at %08x after %d steps (reason %d)",
+					tf3FieldPlanner_.LastCancel() == TagForce3Duel::FieldActionPlanner::CancelReason::NONE ? "arrived" : "cancelled",
+					tf3FieldSnapshot_.cursorCode, tf3FieldPlanner_.Steps(), (int)tf3FieldPlanner_.LastCancel());
+			}
+		}
+	}
+	bool tf3PlannerRunning = tf3LanguagePlanner_.Active() || tf3DuelPlanner_.Driving() || tf3FieldPlanner_.Active();
+	if (tf3LanguagePlanner_.Active()) {
+		bool menuAvailable = (!chatMenu_ || chatMenu_->GetVisibility() != UI::V_VISIBLE) &&
+			GameLayoutConfig().iInternalScreenRotation == ROTATION_LOCKED_HORIZONTAL;
+		TagForce3Language::Context context{ tf3LanguageSnapshot_, menuAvailable, IsOnTop(), !gameRunning || stateBusy, tf3StateSerial_ };
+		TagForce3Language::Step step = tf3LanguagePlanner_.Update(context, time_now_d());
+		uint32_t press = step.press == TagForce3Language::Direction::UP ? CTRL_UP :
+			step.press == TagForce3Language::Direction::DOWN ? CTRL_DOWN : 0;
+		uint32_t release = step.release == TagForce3Language::Direction::UP ? CTRL_UP :
+			step.release == TagForce3Language::Direction::DOWN ? CTRL_DOWN : 0;
+		g_controlMapper.SetNavigationButtons(press, release);
+	}
+	if (!g_Config.bTouchNavigation || g_Config.bMouseControl || !IsOnTop() || !PSP_IsInited() || bootPending_ ||
+		(chatMenu_ && chatMenu_->GetVisibility() == UI::V_VISIBLE)) {
+		ResetTouchNavigation();
+	} else if (!tf3PlannerRunning) {
+		TouchNavigation::Step step = touchNavigation_.Update(time_now_d());
+		g_controlMapper.SetNavigationButtons(step.press, step.release);
+	}
 
 	if (releaseMapperInput_) {
 		// Otherwise a stick let go inside the chat would stay pushed for the game.
